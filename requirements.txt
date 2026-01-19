@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+beautifulsoup4
+requests
+google-generativeai
+pinecone-client
+pydantic
+uvicorn[standard]

@@ -3,6 +3,6 @@ uvicorn
 beautifulsoup4
 requests
 google-generativeai
-pinecone-client
+pinecone
 pydantic
 uvicorn[standard]

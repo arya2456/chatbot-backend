@@ -123,3 +123,57 @@ def chat_bot(req: ChatRequest):
         
     except Exception as e:
         return {"reply": f"Error: {str(e)}"}
+@app.post("/chat")
+async def chat(request: dict):
+    try:
+        client_id = request.get("client_id")
+        user_message = request.get("message")
+        
+        if not client_id or not user_message:
+            return {"error": "Missing client_id or message"}
+        
+        # Query Pinecone for relevant context
+        # Generate embedding for user's question
+        embedding_response = genai.embed_content(
+            model="models/embedding-001",
+            content=user_message,
+            task_type="retrieval_query"
+        )
+        query_embedding = embedding_response['embedding']
+        
+        # Search in Pinecone
+        results = index.query(
+            vector=query_embedding,
+            top_k=3,
+            include_metadata=True,
+            filter={"client_id": client_id}
+        )
+        
+        # Build context from results
+        context = ""
+        for match in results.matches:
+            if match.metadata and 'text' in match.metadata:
+                context += match.metadata['text'] + "\n\n"
+        
+        # Generate response with Gemini
+        model = genai.GenerativeModel('gemini-pro')
+        
+        prompt = f"""You are a helpful AI assistant for a website. 
+Answer the user's question based on the following context from the website.
+Be concise, friendly, and helpful. If you don't know the answer based on the context, 
+say you don't have that information and suggest contacting the website directly.
+
+Context from website:
+{context}
+
+User's question: {user_message}
+
+Your response:"""
+        
+        response = model.generate_content(prompt)
+        
+        return {"response": response.text}
+        
+    except Exception as e:
+        print(f"Chat error: {str(e)}")
+        return {"error": str(e), "response": "Sorry, I encountered an error. Please try again."}

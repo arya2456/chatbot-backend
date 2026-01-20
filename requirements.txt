@@ -3,7 +3,7 @@ uvicorn[standard]
 beautifulsoup4
 requests
 google-generativeai
-pinecone-client
+pinecone
 pydantic
 python-multipart
 aiohttp

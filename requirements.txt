@@ -1,8 +1,9 @@
 fastapi
-uvicorn
+uvicorn[standard]
 beautifulsoup4
 requests
 google-generativeai
-pinecone
+pinecone-client
 pydantic
-uvicorn[standard]
+python-multipart
+aiohttp

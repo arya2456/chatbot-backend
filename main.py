@@ -43,6 +43,27 @@ class ChatRequest(BaseModel):
     client_id: str
     gemini_api_key: str
 
+# --- HELPER: AUTO-DETECT MODEL ---
+def get_best_model():
+    """
+    Asks Google which models are available for this API Key
+    and picks the first one that supports chatting.
+    """
+    try:
+        for m in genai.list_models():
+            if 'generateContent' in m.supported_generation_methods:
+                if 'flash' in m.name: # Prefer Flash (Faster)
+                    return m.name
+        
+        # If no Flash found, take ANY chat model
+        for m in genai.list_models():
+            if 'generateContent' in m.supported_generation_methods:
+                return m.name
+    except:
+        return "models/gemini-1.5-flash" # Fallback default
+    
+    return "models/gemini-pro"
+
 # --- CRAWLER ---
 async def fetch_url(session, url):
     headers = {
@@ -99,7 +120,6 @@ def home():
 async def train_bot(request: TrainRequest):
     print(f"Starting training for {request.client_id}")
     
-    # 1. Crawl
     try:
         pages = await crawl_website(request.url)
         if not pages:
@@ -107,7 +127,6 @@ async def train_bot(request: TrainRequest):
     except Exception as e:
         return {"status": "error", "detail": f"Crawling crashed: {str(e)}"}
 
-    # 2. Embed
     try:
         genai.configure(api_key=request.gemini_api_key)
         vectors = []
@@ -115,6 +134,7 @@ async def train_bot(request: TrainRequest):
         for page in pages:
             text = page['text'][:4000]
             
+            # Use Auto-Embedding Model
             result = genai.embed_content(
                 model="models/text-embedding-004",
                 content=text,
@@ -159,20 +179,25 @@ async def chat_bot(request: ChatRequest):
 
         context = "\n".join([m['metadata']['text'] for m in search_results['matches']])
         
-        # 3. Generate Answer 
-        # FIXED: Using the specific version ID "gemini-1.5-flash-001"
+        # 3. Generate Answer with AUTO-DETECT
         try:
-            model = genai.GenerativeModel("gemini-1.5-flash-001")
+            # Step A: Try the standard robust name first
+            model_name = "models/gemini-1.5-flash" 
+            model = genai.GenerativeModel(model_name)
             response = model.generate_content(
-                f"Context from website:\n{context}\n\nUser Question: {request.message}\nAnswer as a helpful agent:"
+                f"Context: {context}\n\nQuestion: {request.message}\nAnswer:"
             )
             return {"answer": response.text}
-        except Exception as e:
-            # Fallback to Pro if Flash 001 fails
-            print(f"Flash failed: {e}, trying Pro")
-            model = genai.GenerativeModel("gemini-pro")
+        except Exception as first_error:
+            # Step B: If that fails, ASK GOOGLE what models we have
+            print(f"First attempt failed: {first_error}. Auto-detecting model...")
+            
+            best_model = get_best_model()
+            print(f"Auto-detected model: {best_model}")
+            
+            model = genai.GenerativeModel(best_model)
             response = model.generate_content(
-                f"Context from website:\n{context}\n\nUser Question: {request.message}\nAnswer as a helpful agent:"
+                 f"Context: {context}\n\nQuestion: {request.message}\nAnswer:"
             )
             return {"answer": response.text}
         

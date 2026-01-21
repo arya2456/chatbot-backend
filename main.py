@@ -10,15 +10,13 @@ from pinecone import Pinecone
 import google.generativeai as genai
 
 # --- CONFIGURATION ---
-# ENSURE THIS MATCHES YOUR PINECONE DASHBOARD EXACTLY
 PINECONE_INDEX_NAME = "chatbot-index" 
 
-# YOUR PINECONE KEY (Hardcoded as fallback for safety)
+# YOUR PINECONE KEY
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY", "pcsk_2Nqmmq_MaJE7qaPCmboMMTC6gLsC8w7Ahx826mLb5a5Lx4vtfKx74zAF7iLhiZHjq3qE2W")
 
 app = FastAPI()
 
-# Allow connections from your website
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -45,9 +43,8 @@ class ChatRequest(BaseModel):
     client_id: str
     gemini_api_key: str
 
-# --- POWERFUL CRAWLER (Pretends to be a human browser) ---
+# --- CRAWLER ---
 async def fetch_url(session, url):
-    # This header makes websites think we are a real Chrome user
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
     }
@@ -77,7 +74,6 @@ async def crawl_website(base_url: str, max_pages: int = 15):
                 visited.add(current_url)
                 
                 soup = BeautifulSoup(html, 'html.parser')
-                # Remove junk like javascript and css
                 for script in soup(["script", "style", "nav", "footer"]): 
                     script.extract()
                 text = soup.get_text(separator=' ', strip=True)
@@ -85,10 +81,8 @@ async def crawl_website(base_url: str, max_pages: int = 15):
                 if len(text) > 100:
                     scraped_data.append({"url": current_url, "text": text})
 
-                # Find internal links
                 for link in soup.find_all('a', href=True):
                     href = link['href']
-                    # Handle relative URLs (e.g. /pricing)
                     if href.startswith(base_url) or href.startswith('/'):
                         full_url = href if href.startswith('http') else base_url.rstrip('/') + href
                         if full_url not in visited:
@@ -105,23 +99,22 @@ def home():
 async def train_bot(request: TrainRequest):
     print(f"Starting training for {request.client_id}")
     
-    # 1. Crawl the website
+    # 1. Crawl
     try:
         pages = await crawl_website(request.url)
         if not pages:
-            return {"status": "error", "detail": "Could not read website. Ensure URL is correct (http/https)."}
+            return {"status": "error", "detail": "Could not read website."}
     except Exception as e:
         return {"status": "error", "detail": f"Crawling crashed: {str(e)}"}
 
-    # 2. Embed and Store in Pinecone
+    # 2. Embed
     try:
         genai.configure(api_key=request.gemini_api_key)
         vectors = []
         
         for page in pages:
-            text = page['text'][:4000] # Increased chunk size
+            text = page['text'][:4000]
             
-            # Use specific model version to avoid 404
             result = genai.embed_content(
                 model="models/text-embedding-004",
                 content=text,
@@ -140,7 +133,7 @@ async def train_bot(request: TrainRequest):
             index.upsert(vectors=vectors, namespace=request.client_id)
             
     except Exception as e:
-         return {"status": "error", "detail": f"AI/Database Error: {str(e)}"}
+         return {"status": "error", "detail": f"AI Error: {str(e)}"}
 
     return {"status": "success", "pages": len(pages)}
 
@@ -149,14 +142,14 @@ async def chat_bot(request: ChatRequest):
     try:
         genai.configure(api_key=request.gemini_api_key)
         
-        # 1. Convert question to numbers (Embedding)
+        # 1. Embedding
         embedding = genai.embed_content(
             model="models/text-embedding-004",
             content=request.message,
             task_type="retrieval_query",
         )['embedding']
 
-        # 2. Search Pinecone for context
+        # 2. Search
         search_results = index.query(
             namespace=request.client_id,
             vector=embedding,
@@ -166,15 +159,22 @@ async def chat_bot(request: ChatRequest):
 
         context = "\n".join([m['metadata']['text'] for m in search_results['matches']])
         
-        # 3. Generate Answer (Using Stable Flash Model)
-        # We use 'models/gemini-1.5-flash' to fix the 404 error
-        model = genai.GenerativeModel(model_name="models/gemini-1.5-flash")
-        
-        prompt = f"Context from website:\n{context}\n\nUser Question: {request.message}\nAnswer as a helpful support agent:"
-        
-        response = model.generate_content(prompt)
-        return {"answer": response.text}
+        # 3. Generate Answer 
+        # FIXED: Using the specific version ID "gemini-1.5-flash-001"
+        try:
+            model = genai.GenerativeModel("gemini-1.5-flash-001")
+            response = model.generate_content(
+                f"Context from website:\n{context}\n\nUser Question: {request.message}\nAnswer as a helpful agent:"
+            )
+            return {"answer": response.text}
+        except Exception as e:
+            # Fallback to Pro if Flash 001 fails
+            print(f"Flash failed: {e}, trying Pro")
+            model = genai.GenerativeModel("gemini-pro")
+            response = model.generate_content(
+                f"Context from website:\n{context}\n\nUser Question: {request.message}\nAnswer as a helpful agent:"
+            )
+            return {"answer": response.text}
         
     except Exception as e:
-        # Returns the actual error message for debugging
         return {"answer": f"System Error: {str(e)}"}

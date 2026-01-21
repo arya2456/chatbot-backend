@@ -1,21 +1,23 @@
 import os
 import asyncio
 import aiohttp
+import traceback
 from bs4 import BeautifulSoup
-from fastapi import FastAPI, HTTPException, Body
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from pinecone import Pinecone
 import google.generativeai as genai
 
 # --- CONFIGURATION ---
-# PASTE YOUR PINECONE KEY HERE IF NOT SET IN RENDER ENVIRONMENT
-PINECONE_API_KEY = os.getenv("PINECONE_API_KEY", "pcsk_2Nqmmq_MaJE7qaPCmboMMTC6gLsC8w7Ahx826mLb5a5Lx4vtfKx74zAF7iLhiZHjq3qE2W") 
-PINECONE_INDEX_NAME = "chatbot-index"
+# ENSURE THIS MATCHES YOUR PINECONE DASHBOARD EXACTLY
+PINECONE_INDEX_NAME = "chatbot-index" 
+
+# PASTE YOUR KEY INSIDE THE QUOTES BELOW
+PINECONE_API_KEY = os.getenv("PINECONE_API_KEY", "pcsk_2Nqmmq_MaJE7qaPCmboMMTC6gLsC8w7Ahx826mLb5a5Lx4vtfKx74zAF7iLhiZHjq3qE2W")
 
 app = FastAPI()
 
-# Allow your cPanel and Client sites to talk to this backend
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -24,15 +26,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- DATABASE SETUP ---
+# --- DATABASE CONNECTION ---
 try:
     pc = Pinecone(api_key=PINECONE_API_KEY)
     index = pc.Index(PINECONE_INDEX_NAME)
 except Exception as e:
-    print(f"Pinecone Error: {e}")
+    print(f"Server Start Error: {e}")
 
 # --- DATA MODELS ---
-# This is what matches your new Dashboard!
 class TrainRequest(BaseModel):
     url: str
     client_id: str 
@@ -43,15 +44,20 @@ class ChatRequest(BaseModel):
     client_id: str
     gemini_api_key: str
 
-# --- CRAWLER ENGINE ---
+# --- POWERFUL CRAWLER (Now pretends to be a human) ---
 async def fetch_url(session, url):
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+    }
     try:
-        async with session.get(url, timeout=10) as response:
+        async with session.get(url, headers=headers, timeout=15) as response:
+            if response.status != 200: return None, url
             return await response.text(), url
-    except:
+    except Exception as e:
+        print(f"Failed to crawl {url}: {e}")
         return None, url
 
-async def crawl_website(base_url: str, max_pages: int = 10):
+async def crawl_website(base_url: str, max_pages: int = 15):
     visited = set()
     to_visit = {base_url}
     scraped_data = []
@@ -69,8 +75,6 @@ async def crawl_website(base_url: str, max_pages: int = 10):
                 visited.add(current_url)
                 
                 soup = BeautifulSoup(html, 'html.parser')
-                
-                # Cleanup HTML
                 for script in soup(["script", "style", "nav", "footer"]): 
                     script.extract()
                 text = soup.get_text(separator=' ', strip=True)
@@ -78,34 +82,27 @@ async def crawl_website(base_url: str, max_pages: int = 10):
                 if len(text) > 100:
                     scraped_data.append({"url": current_url, "text": text})
 
-                # Find links
                 for link in soup.find_all('a', href=True):
                     href = link['href']
                     if href.startswith(base_url) or href.startswith('/'):
                         full_url = href if href.startswith('http') else base_url.rstrip('/') + href
                         if full_url not in visited:
                             to_visit.add(full_url)
-    
     return scraped_data
 
 # --- API ENDPOINTS ---
 
-@app.get("/")
-def home():
-    return {"status": "Chatbot Brain is Active"}
-
 @app.post("/train")
 async def train_bot(request: TrainRequest):
-    print(f"Training for: {request.client_id} on {request.url}")
+    print(f"Starting training for {request.client_id}")
     
     # 1. Crawl
     try:
         pages = await crawl_website(request.url)
+        if not pages:
+            return {"status": "error", "detail": "Could not read website. Ensure URL is correct (http/https)."}
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Crawling failed: {str(e)}")
-    
-    if not pages:
-        raise HTTPException(status_code=400, detail="Could not read website. Check URL.")
+        return {"status": "error", "detail": f"Crawling crashed: {str(e)}"}
 
     # 2. Embed and Store
     try:
@@ -113,7 +110,7 @@ async def train_bot(request: TrainRequest):
         vectors = []
         
         for page in pages:
-            text = page['text'][:2000] # Limit chunk size
+            text = page['text'][:4000] # Increased chunk size for more "Power"
             
             result = genai.embed_content(
                 model="models/text-embedding-004",
@@ -121,8 +118,6 @@ async def train_bot(request: TrainRequest):
                 task_type="retrieval_document",
             )
             embedding = result['embedding']
-            
-            # Simple ID generation
             vector_id = f"{request.client_id}_{abs(hash(page['url']))}"
             
             vectors.append({
@@ -131,12 +126,12 @@ async def train_bot(request: TrainRequest):
                 "metadata": {"text": text, "url": page['url']}
             })
 
-        # Upsert to Pinecone with Namespace
         if vectors:
             index.upsert(vectors=vectors, namespace=request.client_id)
             
     except Exception as e:
-         raise HTTPException(status_code=500, detail=f"AI Error: {str(e)}")
+         # This will now tell you EXACTLY what is wrong in the browser
+         return {"status": "error", "detail": f"AI/Database Error: {str(e)}"}
 
     return {"status": "success", "pages": len(pages)}
 
@@ -145,29 +140,28 @@ async def chat_bot(request: ChatRequest):
     try:
         genai.configure(api_key=request.gemini_api_key)
         
-        # 1. Embed Question
         embedding = genai.embed_content(
             model="models/text-embedding-004",
             content=request.message,
             task_type="retrieval_query",
         )['embedding']
 
-        # 2. Search Pinecone
         search_results = index.query(
             namespace=request.client_id,
             vector=embedding,
-            top_k=3,
+            top_k=5, # Increased context for smarter answers
             include_metadata=True
         )
 
         context = "\n".join([m['metadata']['text'] for m in search_results['matches']])
-
-        # 3. Generate Answer
+        
+        # Using the Smartest Model: Gemini 2.0 Flash
         model = genai.GenerativeModel("gemini-2.0-flash-exp")
-        prompt = f"Context: {context}\n\nUser Question: {request.message}\nAnswer:"
+        prompt = f"Context from website:\n{context}\n\nUser Question: {request.message}\nAnswer as a helpful support agent:"
         
         response = model.generate_content(prompt)
         return {"answer": response.text}
         
     except Exception as e:
-        return {"answer": "I'm having trouble thinking right now."}
+        # Returns the actual error message so we can fix it
+        return {"answer": f"System Error: {str(e)}"}

@@ -155,8 +155,8 @@ async def chat_bot(request: ChatRequest):
 
         context = "\n".join([m['metadata']['text'] for m in search_results['matches']])
         
-        # Using the Smartest Model: Gemini 2.0 Flash
-        model = genai.GenerativeModel("gemini-2.0-flash-exp")
+        # Using the Smartest Model: gemini-1.5-flash
+        model = genai.GenerativeModel("gemini-1.5-flash")
         prompt = f"Context from website:\n{context}\n\nUser Question: {request.message}\nAnswer as a helpful support agent:"
         
         response = model.generate_content(prompt)

@@ -3,7 +3,7 @@ import asyncio
 import aiohttp
 from urllib.parse import urlparse, urljoin
 from bs4 import BeautifulSoup
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from pinecone import Pinecone
@@ -54,13 +54,13 @@ def get_best_model():
         return "models/gemini-1.5-flash"
     return "models/gemini-pro"
 
-# --- SMART CRAWLER ---
+# --- CRAWLER LOGIC ---
 async def fetch_url(session, url):
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
     }
     try:
-        async with session.get(url, headers=headers, timeout=8) as response:
+        async with session.get(url, headers=headers, timeout=10) as response:
             if response.status != 200: return None, url
             return await response.text(), url
     except:
@@ -72,19 +72,25 @@ def is_internal_link(base_domain, link_url):
     base_clean = base_domain.replace("www.", "")
     return base_clean in link_domain or link_domain == ""
 
-async def crawl_website(start_url: str, max_pages: int = 50): # INCREASED TO 50
-    if not start_url.startswith('http'): start_url = 'https://' + start_url
-    base_domain = urlparse(start_url).netloc
+async def crawl_and_index(url: str, client_id: str, api_key: str):
+    """
+    Shared function used by both Manual Training and Auto-Sync
+    """
+    print(f"--- STARTING SYNC FOR {client_id} ---")
+    
+    # 1. CRAWL (Max 50 pages)
+    if not url.startswith('http'): url = 'https://' + url
+    base_domain = urlparse(url).netloc
     visited = set()
-    to_visit = {start_url}
+    to_visit = {url}
     scraped_data = []
 
     async with aiohttp.ClientSession() as session:
-        while to_visit and len(visited) < max_pages:
-            batch = list(to_visit)[:8] # Faster batching
+        while to_visit and len(visited) < 50:
+            batch = list(to_visit)[:8] 
             for u in batch: to_visit.remove(u)
             
-            tasks = [fetch_url(session, url) for url in batch]
+            tasks = [fetch_url(session, u) for u in batch]
             results = await asyncio.gather(*tasks)
 
             for html, current_url in results:
@@ -105,37 +111,25 @@ async def crawl_website(start_url: str, max_pages: int = 50): # INCREASED TO 50
                     if is_internal_link(base_domain, full_url):
                         full_url = full_url.split('#')[0].rstrip('/')
                         if full_url not in visited and full_url not in to_visit:
-                            # Filter junk files
                             if not any(x in full_url for x in ['.jpg', '.png', 'login', 'wp-admin', 'mailto', 'tel:']):
                                 to_visit.add(full_url)
-    return scraped_data
+    
+    if not scraped_data:
+        print("Sync Failed: No pages found.")
+        return False
 
-# --- API ENDPOINTS ---
-
-@app.get("/")
-def home():
-    return {"status": "Chatbot Brain is Active"}
-
-@app.post("/train")
-async def train_bot(request: TrainRequest):
+    # 2. EMBED & STORE
     try:
-        pages = await crawl_website(request.url)
-        if not pages:
-            return {"status": "error", "detail": "Could not read website."}
-    except Exception as e:
-        return {"status": "error", "detail": f"Crawling crashed: {str(e)}"}
-
-    try:
-        genai.configure(api_key=request.gemini_api_key)
+        genai.configure(api_key=api_key)
         vectors = []
-        for page in pages:
+        for page in scraped_data:
             text = page['text'][:4000]
             result = genai.embed_content(
                 model="models/text-embedding-004",
                 content=text,
                 task_type="retrieval_document",
             )
-            vector_id = f"{request.client_id}_{abs(hash(page['url']))}"
+            vector_id = f"{client_id}_{abs(hash(page['url']))}"
             vectors.append({
                 "id": vector_id,
                 "values": result['embedding'],
@@ -143,12 +137,38 @@ async def train_bot(request: TrainRequest):
             })
 
         if vectors:
-            index.upsert(vectors=vectors, namespace=request.client_id)
-            
+            index.upsert(vectors=vectors, namespace=client_id)
+            print(f"--- SYNC COMPLETE: Updated {len(vectors)} pages for {client_id} ---")
+            return True
     except Exception as e:
-         return {"status": "error", "detail": f"AI Error: {str(e)}"}
+        print(f"Sync Error: {e}")
+        return False
 
-    return {"status": "success", "pages": len(pages)}
+# --- API ENDPOINTS ---
+
+@app.get("/")
+def home():
+    return {"status": "Chatbot Brain is Active", "features": ["Auto-Sync Ready"]}
+
+@app.post("/train")
+async def train_bot(request: TrainRequest):
+    # Manual Trigger via Dashboard
+    success = await crawl_and_index(request.url, request.client_id, request.gemini_api_key)
+    if success:
+        return {"status": "success", "detail": "Bot updated successfully"}
+    else:
+        return {"status": "error", "detail": "Failed to crawl or index website."}
+
+# --- NEW: AUTO-SYNC ENDPOINT ---
+@app.get("/auto-sync")
+async def auto_sync(url: str, client_id: str, key: str, background_tasks: BackgroundTasks):
+    """
+    GET request that triggers a background update.
+    Usage: /auto-sync?url=...&client_id=...&key=...
+    """
+    # We use BackgroundTasks so the request doesn't time out if crawling takes long
+    background_tasks.add_task(crawl_and_index, url, client_id, key)
+    return {"status": "Sync Started", "message": f"Bot is updating {client_id} in the background. Check back in 2 minutes."}
 
 @app.post("/chat")
 async def chat_bot(request: ChatRequest):
@@ -176,15 +196,14 @@ async def chat_bot(request: ChatRequest):
         
         context_str = "\n\n".join(context_parts)
         
-        # --- NEW "SHORT & SMART" PERSONA ---
         system_instruction = f"""
         You are a smart, efficient assistant for {request.client_id}.
         
         STRICT GUIDELINES:
-        1. BE CONCISE: Maximum 2-3 sentences. No fluff words like "We are thrilled" or "I understand".
+        1. BE CONCISE: Maximum 2-3 sentences. No fluff.
         2. BE DATA-DRIVEN: Use the Source URL provided in the context.
-        3. LINKS: If the user asks for a specific link (like "blogs"), look at the URLs in the context. If you see a URL with '/blog' or '/news', return it. 
-        4. IF MISSING: If you don't have the exact link, check if you can guess it from the domain (e.g. domain.com/blog) or just say "Please check our main menu."
+        3. LINKS: If you see a helpful URL in context (like /blog, /contact), YOU MUST return it.
+        4. FALLBACK: If the answer isn't in the text, say "Please check our website for that specific detail."
         
         CONTEXT:
         {context_str}

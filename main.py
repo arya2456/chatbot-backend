@@ -40,12 +40,34 @@ class TrainRequest(BaseModel):
 class ChatRequest(BaseModel):
     message: str
     client_id: str
-    gemini_api_key: str
+    # Note: gemini_api_key is removed/optional here because we fetch it from DB!
 
 class AutoSyncRequest(BaseModel):
     url: str
     client_id: str
-    gemini_api_key: str
+
+# --- HELPER: KEY MANAGEMENT ---
+def save_client_key(client_id, api_key):
+    """Securely saves the API key in Pinecone metadata"""
+    # We create a special "Config Vector" that holds the key
+    index.upsert(
+        vectors=[{
+            "id": f"config_{client_id}", 
+            "values": [0.0] * 768, # Dummy values (we only need the metadata)
+            "metadata": {"api_key": api_key, "type": "config"}
+        }],
+        namespace=client_id
+    )
+
+def get_client_key(client_id):
+    """Retrieves the API key from Pinecone"""
+    try:
+        response = index.fetch(ids=[f"config_{client_id}"], namespace=client_id)
+        if f"config_{client_id}" in response.vectors:
+            return response.vectors[f"config_{client_id}"].metadata.get("api_key")
+        return None
+    except:
+        return None
 
 # --- HELPER: AUTO-DETECT MODEL ---
 def get_best_model():
@@ -79,10 +101,10 @@ def is_internal_link(base_domain, link_url):
     return base_clean in link_domain or link_domain == ""
 
 async def crawl_and_index(url: str, client_id: str, api_key: str):
-    """
-    Crawls website and updates the Last Sync Timestamp in Pinecone
-    """
-    print(f"--- STARTING BACKGROUND SYNC FOR {client_id} ---")
+    print(f"--- STARTING SYNC FOR {client_id} ---")
+    
+    # 1. First, SECURELY SAVE the key for future use
+    save_client_key(client_id, api_key)
     
     if not url.startswith('http'): url = 'https://' + url
     base_domain = urlparse(url).netloc
@@ -138,22 +160,19 @@ async def crawl_and_index(url: str, client_id: str, api_key: str):
                 "metadata": {"text": text, "url": page['url']}
             })
 
-        # Save Vectors
         if vectors:
             index.upsert(vectors=vectors, namespace=client_id)
             
-            # --- CRITICAL: SAVE THE SYNC TIMESTAMP ---
-            # We save a dummy vector named "config_SYNC" to remember the time
+            # Save Sync Timestamp
             current_time = int(time.time())
             index.upsert(
                 vectors=[{
                     "id": "config_SYNC",
-                    "values": [0.1] * 768, # Dummy values
+                    "values": [0.0] * 768, 
                     "metadata": {"last_sync_timestamp": current_time, "info": "DO NOT DELETE"}
                 }],
                 namespace=client_id
             )
-            print(f"--- SYNC COMPLETE for {client_id} at {current_time} ---")
             return True
 
     except Exception as e:
@@ -164,7 +183,7 @@ async def crawl_and_index(url: str, client_id: str, api_key: str):
 
 @app.get("/")
 def home():
-    return {"status": "Chatbot Brain is Active", "mode": "Traffic-Triggered Sync"}
+    return {"status": "Secure Chatbot Brain Active"}
 
 @app.post("/train")
 async def train_bot(request: TrainRequest):
@@ -172,46 +191,43 @@ async def train_bot(request: TrainRequest):
     if success: return {"status": "success"}
     else: return {"status": "error"}
 
-# --- NEW: TRAFFIC TRIGGERED SYNC ---
 @app.post("/trigger-sync")
 async def trigger_sync(request: AutoSyncRequest, background_tasks: BackgroundTasks):
-    """
-    Called by the widget.js when a user visits the site.
-    Checks if 24 hours have passed since last sync.
-    """
     try:
-        # 1. Check "Memory" for last sync time
+        # 1. RETRIEVE KEY INTERNALLY
+        api_key = get_client_key(request.client_id)
+        if not api_key: return {"status": "Error: Key not found. Please re-train."}
+
+        # 2. Check Time
         fetch_response = index.fetch(ids=["config_SYNC"], namespace=request.client_id)
-        
         should_sync = False
         current_time = int(time.time())
         
         if "config_SYNC" in fetch_response.vectors:
             last_sync = int(fetch_response.vectors["config_SYNC"].metadata.get("last_sync_timestamp", 0))
-            # 86400 seconds = 24 Hours
-            if (current_time - last_sync) > 86400:
+            if (current_time - last_sync) > 86400: # 24 Hours
                 should_sync = True
-                print(f"Time to sync {request.client_id}! Last sync was {last_sync}")
-            else:
-                print(f"Skipping sync for {request.client_id}. Up to date.")
         else:
-            # Never synced before (or first time using this new system)
             should_sync = True
         
         if should_sync:
-            background_tasks.add_task(crawl_and_index, request.url, request.client_id, request.gemini_api_key)
-            return {"status": "Sync Started (Background)"}
+            background_tasks.add_task(crawl_and_index, request.url, request.client_id, api_key)
+            return {"status": "Sync Started"}
             
         return {"status": "Up to date"}
 
     except Exception as e:
         return {"status": "error", "detail": str(e)}
 
-
 @app.post("/chat")
 async def chat_bot(request: ChatRequest):
     try:
-        genai.configure(api_key=request.gemini_api_key)
+        # 1. SECURE KEY LOOKUP (No longer accepts key from Frontend)
+        api_key = get_client_key(request.client_id)
+        if not api_key:
+            return {"answer": "Security Error: API Key not found. Please re-train the bot via the dashboard."}
+
+        genai.configure(api_key=api_key)
         
         embedding = genai.embed_content(
             model="models/text-embedding-004",
@@ -239,8 +255,8 @@ async def chat_bot(request: ChatRequest):
         STRICT GUIDELINES:
         1. BE CONCISE: Maximum 2-3 sentences.
         2. BE DATA-DRIVEN: Use the Source URL provided.
-        3. LINKS: Return clickable links (Markdown) if found.
-        4. FALLBACK: If unsure, ask user to check website.
+        3. LINKS: Return clickable links (Markdown).
+        4. FALLBACK: Ask user to check website if unknown.
         
         CONTEXT:
         {context_str}

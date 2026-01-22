@@ -60,11 +60,10 @@ async def fetch_url(session, url):
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
     }
     try:
-        async with session.get(url, headers=headers, timeout=10) as response:
+        async with session.get(url, headers=headers, timeout=8) as response:
             if response.status != 200: return None, url
             return await response.text(), url
-    except Exception as e:
-        print(f"Failed to crawl {url}: {e}")
+    except:
         return None, url
 
 def is_internal_link(base_domain, link_url):
@@ -73,7 +72,7 @@ def is_internal_link(base_domain, link_url):
     base_clean = base_domain.replace("www.", "")
     return base_clean in link_domain or link_domain == ""
 
-async def crawl_website(start_url: str, max_pages: int = 20):
+async def crawl_website(start_url: str, max_pages: int = 50): # INCREASED TO 50
     if not start_url.startswith('http'): start_url = 'https://' + start_url
     base_domain = urlparse(start_url).netloc
     visited = set()
@@ -82,7 +81,7 @@ async def crawl_website(start_url: str, max_pages: int = 20):
 
     async with aiohttp.ClientSession() as session:
         while to_visit and len(visited) < max_pages:
-            batch = list(to_visit)[:5] 
+            batch = list(to_visit)[:8] # Faster batching
             for u in batch: to_visit.remove(u)
             
             tasks = [fetch_url(session, url) for url in batch]
@@ -106,7 +105,8 @@ async def crawl_website(start_url: str, max_pages: int = 20):
                     if is_internal_link(base_domain, full_url):
                         full_url = full_url.split('#')[0].rstrip('/')
                         if full_url not in visited and full_url not in to_visit:
-                            if not any(x in full_url for x in ['.jpg', '.png', 'login', 'wp-admin', 'mailto']):
+                            # Filter junk files
+                            if not any(x in full_url for x in ['.jpg', '.png', 'login', 'wp-admin', 'mailto', 'tel:']):
                                 to_visit.add(full_url)
     return scraped_data
 
@@ -118,7 +118,6 @@ def home():
 
 @app.post("/train")
 async def train_bot(request: TrainRequest):
-    print(f"Training request for {request.url}")
     try:
         pages = await crawl_website(request.url)
         if not pages:
@@ -156,48 +155,41 @@ async def chat_bot(request: ChatRequest):
     try:
         genai.configure(api_key=request.gemini_api_key)
         
-        # 1. Embed Question
         embedding = genai.embed_content(
             model="models/text-embedding-004",
             content=request.message,
             task_type="retrieval_query",
         )['embedding']
 
-        # 2. Search Pinecone
         search_results = index.query(
             namespace=request.client_id,
             vector=embedding,
-            top_k=5, 
+            top_k=4, 
             include_metadata=True
         )
 
-        # 3. Build Context WITH URLs
-        # We now include the URL in the text so the AI knows where the info came from
         context_parts = []
         for m in search_results['matches']:
-            url = m['metadata'].get('url', 'Unknown URL')
+            url = m['metadata'].get('url', '')
             text = m['metadata']['text']
-            context_parts.append(f"SOURCE URL: {url}\nCONTENT: {text}")
+            context_parts.append(f"URL: {url}\nINFO: {text}")
         
         context_str = "\n\n".join(context_parts)
         
-        # 4. The "Persona" Prompt
-        # This instructs the AI to be an Employee, not a Reader
+        # --- NEW "SHORT & SMART" PERSONA ---
         system_instruction = f"""
-        You are a helpful, enthusiastic employee of {request.client_id}. 
-        Your goal is to help visitors and convert them into customers.
-
-        STRICT RULES:
-        1. ALWAYS use "We", "Us", and "Our" to refer to the company. Never say "The provided text" or "The website".
-        2. If you find a URL in the context that matches the user's request (like 'Audit' or 'Contact'), YOU MUST provide the clickable link in Markdown format: [Link Text](URL).
-        3. If specific pricing is missing, say: "We tailor our pricing to your needs! Let's get on a call to give you the best quote."
-        4. Be short, professional, and friendly.
-
-        CONTEXT FROM OUR KNOWLEDGE BASE:
+        You are a smart, efficient assistant for {request.client_id}.
+        
+        STRICT GUIDELINES:
+        1. BE CONCISE: Maximum 2-3 sentences. No fluff words like "We are thrilled" or "I understand".
+        2. BE DATA-DRIVEN: Use the Source URL provided in the context.
+        3. LINKS: If the user asks for a specific link (like "blogs"), look at the URLs in the context. If you see a URL with '/blog' or '/news', return it. 
+        4. IF MISSING: If you don't have the exact link, check if you can guess it from the domain (e.g. domain.com/blog) or just say "Please check our main menu."
+        
+        CONTEXT:
         {context_str}
         """
 
-        # 5. Generate Answer
         try:
             model = genai.GenerativeModel("models/gemini-1.5-flash")
             response = model.generate_content(f"{system_instruction}\n\nUSER QUESTION: {request.message}")

@@ -1,6 +1,7 @@
 import os
 import asyncio
 import aiohttp
+import time
 from urllib.parse import urlparse, urljoin
 from bs4 import BeautifulSoup
 from fastapi import FastAPI, HTTPException, BackgroundTasks
@@ -41,6 +42,11 @@ class ChatRequest(BaseModel):
     client_id: str
     gemini_api_key: str
 
+class AutoSyncRequest(BaseModel):
+    url: str
+    client_id: str
+    gemini_api_key: str
+
 # --- HELPER: AUTO-DETECT MODEL ---
 def get_best_model():
     try:
@@ -74,11 +80,10 @@ def is_internal_link(base_domain, link_url):
 
 async def crawl_and_index(url: str, client_id: str, api_key: str):
     """
-    Shared function used by both Manual Training and Auto-Sync
+    Crawls website and updates the Last Sync Timestamp in Pinecone
     """
-    print(f"--- STARTING SYNC FOR {client_id} ---")
+    print(f"--- STARTING BACKGROUND SYNC FOR {client_id} ---")
     
-    # 1. CRAWL (Max 50 pages)
     if not url.startswith('http'): url = 'https://' + url
     base_domain = urlparse(url).netloc
     visited = set()
@@ -114,11 +119,8 @@ async def crawl_and_index(url: str, client_id: str, api_key: str):
                             if not any(x in full_url for x in ['.jpg', '.png', 'login', 'wp-admin', 'mailto', 'tel:']):
                                 to_visit.add(full_url)
     
-    if not scraped_data:
-        print("Sync Failed: No pages found.")
-        return False
+    if not scraped_data: return False
 
-    # 2. EMBED & STORE
     try:
         genai.configure(api_key=api_key)
         vectors = []
@@ -136,10 +138,24 @@ async def crawl_and_index(url: str, client_id: str, api_key: str):
                 "metadata": {"text": text, "url": page['url']}
             })
 
+        # Save Vectors
         if vectors:
             index.upsert(vectors=vectors, namespace=client_id)
-            print(f"--- SYNC COMPLETE: Updated {len(vectors)} pages for {client_id} ---")
+            
+            # --- CRITICAL: SAVE THE SYNC TIMESTAMP ---
+            # We save a dummy vector named "config_SYNC" to remember the time
+            current_time = int(time.time())
+            index.upsert(
+                vectors=[{
+                    "id": "config_SYNC",
+                    "values": [0.1] * 768, # Dummy values
+                    "metadata": {"last_sync_timestamp": current_time, "info": "DO NOT DELETE"}
+                }],
+                namespace=client_id
+            )
+            print(f"--- SYNC COMPLETE for {client_id} at {current_time} ---")
             return True
+
     except Exception as e:
         print(f"Sync Error: {e}")
         return False
@@ -148,27 +164,49 @@ async def crawl_and_index(url: str, client_id: str, api_key: str):
 
 @app.get("/")
 def home():
-    return {"status": "Chatbot Brain is Active", "features": ["Auto-Sync Ready"]}
+    return {"status": "Chatbot Brain is Active", "mode": "Traffic-Triggered Sync"}
 
 @app.post("/train")
 async def train_bot(request: TrainRequest):
-    # Manual Trigger via Dashboard
     success = await crawl_and_index(request.url, request.client_id, request.gemini_api_key)
-    if success:
-        return {"status": "success", "detail": "Bot updated successfully"}
-    else:
-        return {"status": "error", "detail": "Failed to crawl or index website."}
+    if success: return {"status": "success"}
+    else: return {"status": "error"}
 
-# --- NEW: AUTO-SYNC ENDPOINT ---
-@app.get("/auto-sync")
-async def auto_sync(url: str, client_id: str, key: str, background_tasks: BackgroundTasks):
+# --- NEW: TRAFFIC TRIGGERED SYNC ---
+@app.post("/trigger-sync")
+async def trigger_sync(request: AutoSyncRequest, background_tasks: BackgroundTasks):
     """
-    GET request that triggers a background update.
-    Usage: /auto-sync?url=...&client_id=...&key=...
+    Called by the widget.js when a user visits the site.
+    Checks if 24 hours have passed since last sync.
     """
-    # We use BackgroundTasks so the request doesn't time out if crawling takes long
-    background_tasks.add_task(crawl_and_index, url, client_id, key)
-    return {"status": "Sync Started", "message": f"Bot is updating {client_id} in the background. Check back in 2 minutes."}
+    try:
+        # 1. Check "Memory" for last sync time
+        fetch_response = index.fetch(ids=["config_SYNC"], namespace=request.client_id)
+        
+        should_sync = False
+        current_time = int(time.time())
+        
+        if "config_SYNC" in fetch_response.vectors:
+            last_sync = int(fetch_response.vectors["config_SYNC"].metadata.get("last_sync_timestamp", 0))
+            # 86400 seconds = 24 Hours
+            if (current_time - last_sync) > 86400:
+                should_sync = True
+                print(f"Time to sync {request.client_id}! Last sync was {last_sync}")
+            else:
+                print(f"Skipping sync for {request.client_id}. Up to date.")
+        else:
+            # Never synced before (or first time using this new system)
+            should_sync = True
+        
+        if should_sync:
+            background_tasks.add_task(crawl_and_index, request.url, request.client_id, request.gemini_api_key)
+            return {"status": "Sync Started (Background)"}
+            
+        return {"status": "Up to date"}
+
+    except Exception as e:
+        return {"status": "error", "detail": str(e)}
+
 
 @app.post("/chat")
 async def chat_bot(request: ChatRequest):
@@ -198,12 +236,11 @@ async def chat_bot(request: ChatRequest):
         
         system_instruction = f"""
         You are a smart, efficient assistant for {request.client_id}.
-        
         STRICT GUIDELINES:
-        1. BE CONCISE: Maximum 2-3 sentences. No fluff.
-        2. BE DATA-DRIVEN: Use the Source URL provided in the context.
-        3. LINKS: If you see a helpful URL in context (like /blog, /contact), YOU MUST return it.
-        4. FALLBACK: If the answer isn't in the text, say "Please check our website for that specific detail."
+        1. BE CONCISE: Maximum 2-3 sentences.
+        2. BE DATA-DRIVEN: Use the Source URL provided.
+        3. LINKS: Return clickable links (Markdown) if found.
+        4. FALLBACK: If unsure, ask user to check website.
         
         CONTEXT:
         {context_str}

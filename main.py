@@ -11,8 +11,6 @@ import google.generativeai as genai
 
 # --- CONFIGURATION ---
 PINECONE_INDEX_NAME = "chatbot-index" 
-
-# YOUR PINECONE KEY
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY", "pcsk_2Nqmmq_MaJE7qaPCmboMMTC6gLsC8w7Ahx826mLb5a5Lx4vtfKx74zAF7iLhiZHjq3qE2W")
 
 app = FastAPI()
@@ -63,38 +61,27 @@ async def fetch_url(session, url):
     }
     try:
         async with session.get(url, headers=headers, timeout=10) as response:
-            if response.status != 200: 
-                print(f"Skipping {url} - Status {response.status}")
-                return None, url
+            if response.status != 200: return None, url
             return await response.text(), url
     except Exception as e:
         print(f"Failed to crawl {url}: {e}")
         return None, url
 
 def is_internal_link(base_domain, link_url):
-    """
-    Checks if a link belongs to the same website, ignoring www.
-    """
     link_parts = urlparse(link_url)
     link_domain = link_parts.netloc.replace("www.", "")
     base_clean = base_domain.replace("www.", "")
-    
     return base_clean in link_domain or link_domain == ""
 
 async def crawl_website(start_url: str, max_pages: int = 20):
-    # normalize start url
     if not start_url.startswith('http'): start_url = 'https://' + start_url
-    
     base_domain = urlparse(start_url).netloc
     visited = set()
     to_visit = {start_url}
     scraped_data = []
 
-    print(f"--- STARTING CRAWL: {start_url} ---")
-
     async with aiohttp.ClientSession() as session:
         while to_visit and len(visited) < max_pages:
-            # Grab a batch of URLs
             batch = list(to_visit)[:5] 
             for u in batch: to_visit.remove(u)
             
@@ -104,34 +91,23 @@ async def crawl_website(start_url: str, max_pages: int = 20):
             for html, current_url in results:
                 if not html: continue
                 visited.add(current_url)
-                print(f"Crawled: {current_url}") # LOGGING PROOF
                 
                 soup = BeautifulSoup(html, 'html.parser')
-                
-                # Clean text
                 for script in soup(["script", "style", "nav", "footer", "iframe"]): 
                     script.extract()
                 text = soup.get_text(separator=' ', strip=True)
                 
-                if len(text) > 200: # Only save pages with actual content
+                if len(text) > 200:
                     scraped_data.append({"url": current_url, "text": text})
 
-                # Find ALL links
                 for link in soup.find_all('a', href=True):
                     href = link['href']
                     full_url = urljoin(current_url, href)
-                    
-                    # Filter for internal links only
                     if is_internal_link(base_domain, full_url):
-                        # Clean anchors (#section)
                         full_url = full_url.split('#')[0].rstrip('/')
-                        
                         if full_url not in visited and full_url not in to_visit:
-                            # Avoid junk links
-                            if not any(x in full_url for x in ['.jpg', '.png', '.pdf', 'login', 'wp-admin', 'mailto']):
+                            if not any(x in full_url for x in ['.jpg', '.png', 'login', 'wp-admin', 'mailto']):
                                 to_visit.add(full_url)
-                                
-    print(f"--- CRAWL FINISHED: Found {len(scraped_data)} pages ---")
     return scraped_data
 
 # --- API ENDPOINTS ---
@@ -142,8 +118,7 @@ def home():
 
 @app.post("/train")
 async def train_bot(request: TrainRequest):
-    print(f"Received Training Request for {request.url}")
-    
+    print(f"Training request for {request.url}")
     try:
         pages = await crawl_website(request.url)
         if not pages:
@@ -154,17 +129,14 @@ async def train_bot(request: TrainRequest):
     try:
         genai.configure(api_key=request.gemini_api_key)
         vectors = []
-        
         for page in pages:
             text = page['text'][:4000]
-            
             result = genai.embed_content(
                 model="models/text-embedding-004",
                 content=text,
                 task_type="retrieval_document",
             )
             vector_id = f"{request.client_id}_{abs(hash(page['url']))}"
-            
             vectors.append({
                 "id": vector_id,
                 "values": result['embedding'],
@@ -177,19 +149,21 @@ async def train_bot(request: TrainRequest):
     except Exception as e:
          return {"status": "error", "detail": f"AI Error: {str(e)}"}
 
-    return {"status": "success", "pages_crawled": len(pages)}
+    return {"status": "success", "pages": len(pages)}
 
 @app.post("/chat")
 async def chat_bot(request: ChatRequest):
     try:
         genai.configure(api_key=request.gemini_api_key)
         
+        # 1. Embed Question
         embedding = genai.embed_content(
             model="models/text-embedding-004",
             content=request.message,
             task_type="retrieval_query",
         )['embedding']
 
+        # 2. Search Pinecone
         search_results = index.query(
             namespace=request.client_id,
             vector=embedding,
@@ -197,16 +171,40 @@ async def chat_bot(request: ChatRequest):
             include_metadata=True
         )
 
-        context = "\n".join([m['metadata']['text'] for m in search_results['matches']])
+        # 3. Build Context WITH URLs
+        # We now include the URL in the text so the AI knows where the info came from
+        context_parts = []
+        for m in search_results['matches']:
+            url = m['metadata'].get('url', 'Unknown URL')
+            text = m['metadata']['text']
+            context_parts.append(f"SOURCE URL: {url}\nCONTENT: {text}")
         
-        # Auto-Select Model
+        context_str = "\n\n".join(context_parts)
+        
+        # 4. The "Persona" Prompt
+        # This instructs the AI to be an Employee, not a Reader
+        system_instruction = f"""
+        You are a helpful, enthusiastic employee of {request.client_id}. 
+        Your goal is to help visitors and convert them into customers.
+
+        STRICT RULES:
+        1. ALWAYS use "We", "Us", and "Our" to refer to the company. Never say "The provided text" or "The website".
+        2. If you find a URL in the context that matches the user's request (like 'Audit' or 'Contact'), YOU MUST provide the clickable link in Markdown format: [Link Text](URL).
+        3. If specific pricing is missing, say: "We tailor our pricing to your needs! Let's get on a call to give you the best quote."
+        4. Be short, professional, and friendly.
+
+        CONTEXT FROM OUR KNOWLEDGE BASE:
+        {context_str}
+        """
+
+        # 5. Generate Answer
         try:
             model = genai.GenerativeModel("models/gemini-1.5-flash")
-            response = model.generate_content(f"Context: {context}\n\nQuestion: {request.message}\nAnswer:")
+            response = model.generate_content(f"{system_instruction}\n\nUSER QUESTION: {request.message}")
             return {"answer": response.text}
         except:
             model = genai.GenerativeModel(get_best_model())
-            response = model.generate_content(f"Context: {context}\n\nQuestion: {request.message}\nAnswer:")
+            response = model.generate_content(f"{system_instruction}\n\nUSER QUESTION: {request.message}")
             return {"answer": response.text}
         
     except Exception as e:

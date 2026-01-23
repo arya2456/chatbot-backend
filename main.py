@@ -10,7 +10,7 @@ from pydantic import BaseModel
 from pinecone import Pinecone
 import google.generativeai as genai
 
-# --- CONFIGURATION ---
+# --- CONFIG ---
 PINECONE_INDEX_NAME = "chatbot-index" 
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY", "pcsk_2Nqmmq_MaJE7qaPCmboMMTC6gLsC8w7Ahx826mLb5a5Lx4vtfKx74zAF7iLhiZHjq3qE2W")
 
@@ -24,14 +24,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- DATABASE CONNECTION ---
+# --- DB SETUP ---
 try:
     pc = Pinecone(api_key=PINECONE_API_KEY)
     index = pc.Index(PINECONE_INDEX_NAME)
 except Exception as e:
     print(f"Server Start Error: {e}")
 
-# --- DATA MODELS ---
+# --- MODELS ---
 class TrainRequest(BaseModel):
     url: str
     client_id: str 
@@ -40,27 +40,27 @@ class TrainRequest(BaseModel):
 class ChatRequest(BaseModel):
     message: str
     client_id: str
-    # Note: gemini_api_key is removed/optional here because we fetch it from DB!
 
 class AutoSyncRequest(BaseModel):
     url: str
     client_id: str
 
-# --- HELPER: KEY MANAGEMENT ---
+# --- HELPERS ---
 def save_client_key(client_id, api_key):
-    """Securely saves the API key in Pinecone metadata"""
-    # We create a special "Config Vector" that holds the key
-    index.upsert(
-        vectors=[{
-            "id": f"config_{client_id}", 
-            "values": [0.0] * 768, # Dummy values (we only need the metadata)
-            "metadata": {"api_key": api_key, "type": "config"}
-        }],
-        namespace=client_id
-    )
+    try:
+        # FIX: Changed [0.0] to [1.0] to satisfy Pinecone requirements
+        index.upsert(
+            vectors=[{
+                "id": f"config_{client_id}", 
+                "values": [1.0] * 768, 
+                "metadata": {"api_key": api_key, "type": "config"}
+            }],
+            namespace=client_id
+        )
+    except Exception as e:
+        print(f"Error saving key: {e}")
 
 def get_client_key(client_id):
-    """Retrieves the API key from Pinecone"""
     try:
         response = index.fetch(ids=[f"config_{client_id}"], namespace=client_id)
         if f"config_{client_id}" in response.vectors:
@@ -69,7 +69,6 @@ def get_client_key(client_id):
     except:
         return None
 
-# --- HELPER: AUTO-DETECT MODEL ---
 def get_best_model():
     try:
         for m in genai.list_models():
@@ -82,11 +81,9 @@ def get_best_model():
         return "models/gemini-1.5-flash"
     return "models/gemini-pro"
 
-# --- CRAWLER LOGIC ---
+# --- CRAWLER ---
 async def fetch_url(session, url):
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
-    }
+    headers = {"User-Agent": "Mozilla/5.0"}
     try:
         async with session.get(url, headers=headers, timeout=10) as response:
             if response.status != 200: return None, url
@@ -101,9 +98,9 @@ def is_internal_link(base_domain, link_url):
     return base_clean in link_domain or link_domain == ""
 
 async def crawl_and_index(url: str, client_id: str, api_key: str):
-    print(f"--- STARTING SYNC FOR {client_id} ---")
+    print(f"--- SYNC START: {client_id} ---")
     
-    # 1. First, SECURELY SAVE the key for future use
+    # SAVE KEY FIRST
     save_client_key(client_id, api_key)
     
     if not url.startswith('http'): url = 'https://' + url
@@ -116,19 +113,15 @@ async def crawl_and_index(url: str, client_id: str, api_key: str):
         while to_visit and len(visited) < 50:
             batch = list(to_visit)[:8] 
             for u in batch: to_visit.remove(u)
-            
             tasks = [fetch_url(session, u) for u in batch]
             results = await asyncio.gather(*tasks)
 
             for html, current_url in results:
                 if not html: continue
                 visited.add(current_url)
-                
                 soup = BeautifulSoup(html, 'html.parser')
-                for script in soup(["script", "style", "nav", "footer", "iframe"]): 
-                    script.extract()
+                for script in soup(["script", "style", "nav", "footer", "iframe"]): script.extract()
                 text = soup.get_text(separator=' ', strip=True)
-                
                 if len(text) > 200:
                     scraped_data.append({"url": current_url, "text": text})
 
@@ -138,7 +131,7 @@ async def crawl_and_index(url: str, client_id: str, api_key: str):
                     if is_internal_link(base_domain, full_url):
                         full_url = full_url.split('#')[0].rstrip('/')
                         if full_url not in visited and full_url not in to_visit:
-                            if not any(x in full_url for x in ['.jpg', '.png', 'login', 'wp-admin', 'mailto', 'tel:']):
+                            if not any(x in full_url for x in ['.jpg', '.png', 'login', 'wp-admin']):
                                 to_visit.add(full_url)
     
     if not scraped_data: return False
@@ -162,28 +155,24 @@ async def crawl_and_index(url: str, client_id: str, api_key: str):
 
         if vectors:
             index.upsert(vectors=vectors, namespace=client_id)
-            
-            # Save Sync Timestamp
             current_time = int(time.time())
+            # FIX: Changed [0.0] to [1.0] here as well
             index.upsert(
                 vectors=[{
                     "id": "config_SYNC",
-                    "values": [0.0] * 768, 
-                    "metadata": {"last_sync_timestamp": current_time, "info": "DO NOT DELETE"}
+                    "values": [1.0] * 768, 
+                    "metadata": {"last_sync_timestamp": current_time}
                 }],
                 namespace=client_id
             )
             return True
-
     except Exception as e:
         print(f"Sync Error: {e}")
         return False
 
-# --- API ENDPOINTS ---
-
+# --- API ---
 @app.get("/")
-def home():
-    return {"status": "Secure Chatbot Brain Active"}
+def home(): return {"status": "Secure Brain Active"}
 
 @app.post("/train")
 async def train_bot(request: TrainRequest):
@@ -193,42 +182,19 @@ async def train_bot(request: TrainRequest):
 
 @app.post("/trigger-sync")
 async def trigger_sync(request: AutoSyncRequest, background_tasks: BackgroundTasks):
-    try:
-        # 1. RETRIEVE KEY INTERNALLY
-        api_key = get_client_key(request.client_id)
-        if not api_key: return {"status": "Error: Key not found. Please re-train."}
-
-        # 2. Check Time
-        fetch_response = index.fetch(ids=["config_SYNC"], namespace=request.client_id)
-        should_sync = False
-        current_time = int(time.time())
-        
-        if "config_SYNC" in fetch_response.vectors:
-            last_sync = int(fetch_response.vectors["config_SYNC"].metadata.get("last_sync_timestamp", 0))
-            if (current_time - last_sync) > 86400: # 24 Hours
-                should_sync = True
-        else:
-            should_sync = True
-        
-        if should_sync:
-            background_tasks.add_task(crawl_and_index, request.url, request.client_id, api_key)
-            return {"status": "Sync Started"}
-            
-        return {"status": "Up to date"}
-
-    except Exception as e:
-        return {"status": "error", "detail": str(e)}
+    api_key = get_client_key(request.client_id)
+    if not api_key: return {"status": "No Key Found"}
+    
+    background_tasks.add_task(crawl_and_index, request.url, request.client_id, api_key)
+    return {"status": "Sync Started"}
 
 @app.post("/chat")
 async def chat_bot(request: ChatRequest):
-    try:
-        # 1. SECURE KEY LOOKUP (No longer accepts key from Frontend)
-        api_key = get_client_key(request.client_id)
-        if not api_key:
-            return {"answer": "Security Error: API Key not found. Please re-train the bot via the dashboard."}
+    api_key = get_client_key(request.client_id)
+    if not api_key: return {"answer": "Security Error: Please re-train bot."}
 
+    try:
         genai.configure(api_key=api_key)
-        
         embedding = genai.embed_content(
             model="models/text-embedding-004",
             content=request.message,
@@ -236,40 +202,21 @@ async def chat_bot(request: ChatRequest):
         )['embedding']
 
         search_results = index.query(
-            namespace=request.client_id,
-            vector=embedding,
-            top_k=4, 
-            include_metadata=True
+            namespace=request.client_id, vector=embedding, top_k=4, include_metadata=True
         )
 
-        context_parts = []
-        for m in search_results['matches']:
-            url = m['metadata'].get('url', '')
-            text = m['metadata']['text']
-            context_parts.append(f"URL: {url}\nINFO: {text}")
+        context = "\n\n".join([f"URL: {m['metadata'].get('url','')}\nINFO: {m['metadata']['text']}" for m in search_results['matches']])
         
-        context_str = "\n\n".join(context_parts)
+        system = f"You are a helpful assistant for {request.client_id}. Use this context:\n{context}\n\nBe concise and use 'We'."
         
-        system_instruction = f"""
-        You are a smart, efficient assistant for {request.client_id}.
-        STRICT GUIDELINES:
-        1. BE CONCISE: Maximum 2-3 sentences.
-        2. BE DATA-DRIVEN: Use the Source URL provided.
-        3. LINKS: Return clickable links (Markdown).
-        4. FALLBACK: Ask user to check website if unknown.
-        
-        CONTEXT:
-        {context_str}
-        """
-
         try:
             model = genai.GenerativeModel("models/gemini-1.5-flash")
-            response = model.generate_content(f"{system_instruction}\n\nUSER QUESTION: {request.message}")
-            return {"answer": response.text}
+            res = model.generate_content(f"{system}\n\nQuestion: {request.message}")
+            return {"answer": res.text}
         except:
             model = genai.GenerativeModel(get_best_model())
-            response = model.generate_content(f"{system_instruction}\n\nUSER QUESTION: {request.message}")
-            return {"answer": response.text}
-        
+            res = model.generate_content(f"{system}\n\nQuestion: {request.message}")
+            return {"answer": res.text}
+
     except Exception as e:
-        return {"answer": f"System Error: {str(e)}"}
+        return {"answer": f"Error: {str(e)}"}

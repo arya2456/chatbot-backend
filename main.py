@@ -48,7 +48,6 @@ class AutoSyncRequest(BaseModel):
 # --- HELPERS ---
 def save_client_key(client_id, api_key):
     try:
-        # FIX: Changed [0.0] to [1.0] to satisfy Pinecone requirements
         index.upsert(
             vectors=[{
                 "id": f"config_{client_id}", 
@@ -99,8 +98,6 @@ def is_internal_link(base_domain, link_url):
 
 async def crawl_and_index(url: str, client_id: str, api_key: str):
     print(f"--- SYNC START: {client_id} ---")
-    
-    # SAVE KEY FIRST
     save_client_key(client_id, api_key)
     
     if not url.startswith('http'): url = 'https://' + url
@@ -156,7 +153,6 @@ async def crawl_and_index(url: str, client_id: str, api_key: str):
         if vectors:
             index.upsert(vectors=vectors, namespace=client_id)
             current_time = int(time.time())
-            # FIX: Changed [0.0] to [1.0] here as well
             index.upsert(
                 vectors=[{
                     "id": "config_SYNC",
@@ -207,7 +203,29 @@ async def chat_bot(request: ChatRequest):
 
         context = "\n\n".join([f"URL: {m['metadata'].get('url','')}\nINFO: {m['metadata']['text']}" for m in search_results['matches']])
         
-        system = f"You are a helpful assistant for {request.client_id}. Use this context:\n{context}\n\nBe concise and use 'We'."
+        # --- SMART NAV FALLBACK ---
+        # If the crawler missed these pages, we assume they exist based on standard web conventions.
+        base_url = f"https://{request.client_id}"
+        fallback_links = f"""
+        POTENTIAL LINKS (Use these if the crawler found no specific match):
+        - Blogs: {base_url}/blog OR {base_url}/blogs
+        - Contact: {base_url}/contact OR {base_url}/contact-us
+        - Services: {base_url}/services
+        - About: {base_url}/about
+        """
+        
+        system = f"""
+        You are a helpful assistant for {request.client_id}. 
+        CONTEXT:
+        {context}
+        
+        {fallback_links}
+        
+        INSTRUCTIONS:
+        1. If the context has the answer, use it.
+        2. If the user asks for a link (like 'blogs') and you don't see it in Context, use the POTENTIAL LINKS above.
+        3. Be concise. Use 'We'.
+        """
         
         try:
             model = genai.GenerativeModel("models/gemini-1.5-flash")

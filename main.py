@@ -175,7 +175,7 @@ async def crawl_and_index(url: str, client_id: str, api_key: str):
                 
                 soup = BeautifulSoup(html, 'html.parser')
                 
-                # --- FIX: CAPTURE LINKS BEFORE DELETING NAV ---
+                # --- CAPTURE LINKS BEFORE DELETING NAV ---
                 base_domain = urlparse(url).netloc.replace("www.", "")
                 if not sitemap_urls:
                     for link in soup.find_all('a', href=True):
@@ -185,7 +185,7 @@ async def crawl_and_index(url: str, client_id: str, api_key: str):
                                 queue.append(full_url)
                 # ----------------------------------------------
 
-                # Now clean the text
+                # Clean text
                 for script in soup(["script", "style", "nav", "footer", "iframe", "noscript"]): 
                     script.extract()
                 text = soup.get_text(separator='\n', strip=True)
@@ -291,23 +291,31 @@ async def chat_bot(request: ChatRequest):
 
         context = "\n\n".join([f"SOURCE: {m['metadata'].get('url','')}\nTEXT: {m['metadata']['text']}" for m in search_results['matches']])
         
-        # --- FIXED: ADDED POTENTIAL LINKS BACK TO PROMPT ---
         base_url = f"https://{request.client_id}"
+        
+        # --- THE SMART PROMPT (Includes Formatting Rules) ---
         system = f"""
         You are a smart Sales Assistant for {request.client_id}.
         
         CONTEXT FROM WEBSITE:
         {context}
         
-        POTENTIAL NAVIGATION LINKS (Use these if not found in context):
+        POTENTIAL NAVIGATION LINKS:
         - Blogs: {base_url}/blog OR {base_url}/blogs
         - Contact: {base_url}/contact OR {base_url}/contact-us
         - Services: {base_url}/services
         - About: {base_url}/about
         
+        STRICT FORMATTING RULES:
+        1. NEVER write a raw URL like 'https://...'.
+        2. ALWAYS format links using Markdown: [Clickable Text](URL).
+           - BAD: Check this https://fcmedia.in/blogs
+           - GOOD: Check this [FC Media Blogs](https://fcmedia.in/blogs)
+        3. Use bullet points for lists.
+        
         INSTRUCTIONS:
-        1. Answer based ONLY on the context if possible.
-        2. If the user asks for a link (like 'blogs') and it's missing from Context, use the POTENTIAL LINKS above.
+        1. Answer based on context.
+        2. If user asks for links, use the Markdown format above.
         3. If the user provided an email, acknowledge it politely.
         """
         
@@ -329,7 +337,6 @@ async def chat_bot(request: ChatRequest):
 @app.post("/get-leads")
 async def get_leads(request: AutoSyncRequest):
     try:
-        # Dummy query to find leads
         genai.configure(api_key=get_client_key(request.client_id))
         dummy = genai.embed_content(model="models/text-embedding-004", content="mail", task_type="retrieval_query")['embedding']
         results = index.query(namespace=request.client_id, vector=dummy, top_k=50, include_metadata=True, filter={"type": "lead"})

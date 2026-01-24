@@ -26,18 +26,20 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- DATABASE CONNECTION ---
+# --- DATABASE ---
 try:
     pc = Pinecone(api_key=PINECONE_API_KEY)
     index = pc.Index(PINECONE_INDEX_NAME)
 except Exception as e:
     print(f"Server Start Error: {e}")
 
-# --- DATA MODELS ---
+# --- MODELS ---
 class TrainRequest(BaseModel):
     url: str
     client_id: str
     gemini_api_key: str
+    bot_name: str = "AI Support"   # NEW: Default name
+    bot_color: str = "#4F46E5"     # NEW: Default color
 
 class ChatRequest(BaseModel):
     message: str
@@ -47,25 +49,34 @@ class AutoSyncRequest(BaseModel):
     url: str
     client_id: str
 
-# --- HELPER FUNCTIONS ---
-def save_client_key(client_id, api_key):
+class ConfigRequest(BaseModel):
+    client_id: str
+
+# --- HELPERS ---
+def save_client_config(client_id, api_key, bot_name, bot_color):
     try:
+        # We now save Name and Color into the config vector
         index.upsert(
             vectors=[{
                 "id": f"config_{client_id}",
                 "values": [1.0] * 768, 
-                "metadata": {"api_key": api_key, "type": "config"}
+                "metadata": {
+                    "api_key": api_key, 
+                    "type": "config",
+                    "bot_name": bot_name,
+                    "bot_color": bot_color
+                }
             }],
             namespace=client_id
         )
     except Exception as e:
-        print(f"Error saving key: {e}")
+        print(f"Error saving config: {e}")
 
-def get_client_key(client_id):
+def get_client_config(client_id):
     try:
         response = index.fetch(ids=[f"config_{client_id}"], namespace=client_id)
         if f"config_{client_id}" in response.vectors:
-            return response.vectors[f"config_{client_id}"].metadata.get("api_key")
+            return response.vectors[f"config_{client_id}"].metadata
         return None
     except:
         return None
@@ -82,27 +93,17 @@ def check_and_save_lead(message, client_id):
                 vectors=[{
                     "id": lead_id,
                     "values": [1.0] * 768,
-                    "metadata": {
-                        "type": "lead",
-                        "email": email,
-                        "context": message,
-                        "timestamp": timestamp
-                    }
+                    "metadata": {"type": "lead", "email": email, "context": message, "timestamp": timestamp}
                 }],
                 namespace=client_id
             )
             return True
-        except:
-            return False
+        except: return False
     return False
 
-# --- FEATURE: SITEMAP SCANNER ---
+# --- CRAWLER (Standard) ---
 async def fetch_sitemap(session, base_url):
-    potential_sitemaps = [
-        urljoin(base_url, "sitemap.xml"),
-        urljoin(base_url, "sitemap_index.xml"),
-        urljoin(base_url, "wp-sitemap.xml")
-    ]
+    potential_sitemaps = [urljoin(base_url, "sitemap.xml"), urljoin(base_url, "wp-sitemap.xml")]
     found_urls = set()
     for sitemap_url in potential_sitemaps:
         try:
@@ -112,22 +113,19 @@ async def fetch_sitemap(session, base_url):
                     try:
                         root = ET.fromstring(content)
                         for elem in root.iter():
-                            if 'loc' in elem.tag and elem.text:
-                                found_urls.add(elem.text.strip())
+                            if 'loc' in elem.tag and elem.text: found_urls.add(elem.text.strip())
                         if found_urls: return list(found_urls)
                     except: pass
         except: pass
     return []
 
-# --- CRAWLER LOGIC ---
 async def fetch_url(session, url):
     headers = {"User-Agent": "Mozilla/5.0"}
     try:
         async with session.get(url, headers=headers, timeout=10) as response:
             if response.status != 200: return None, url
             return await response.text(), url
-    except:
-        return None, url
+    except: return None, url
 
 def smart_chunk_text(text, max_chars=3000):
     paragraphs = text.split('\n')
@@ -142,9 +140,11 @@ def smart_chunk_text(text, max_chars=3000):
     if current_chunk: chunks.append(current_chunk)
     return chunks
 
-async def crawl_and_index(url: str, client_id: str, api_key: str):
-    print(f"--- STARTING CRAWL FOR {client_id} ---")
-    save_client_key(client_id, api_key)
+async def crawl_and_index(url: str, client_id: str, api_key: str, bot_name: str, bot_color: str):
+    print(f"--- STARTING SETUP FOR {client_id} ---")
+    
+    # SAVE CONFIG FIRST (Name, Color, Key)
+    save_client_config(client_id, api_key, bot_name, bot_color)
     
     if not url.startswith('http'): url = 'https://' + url
     
@@ -152,14 +152,10 @@ async def crawl_and_index(url: str, client_id: str, api_key: str):
     scraped_data = []
     
     async with aiohttp.ClientSession() as session:
-        # 1. Try Sitemap
         sitemap_urls = await fetch_sitemap(session, url)
-        if sitemap_urls:
-            to_visit = set(sitemap_urls[:60]) 
-        else:
-            to_visit = {url}
+        if sitemap_urls: to_visit = set(sitemap_urls[:60]) 
+        else: to_visit = {url}
 
-        # 2. Crawler Loop
         visited = set()
         queue = list(to_visit)
         
@@ -172,10 +168,8 @@ async def crawl_and_index(url: str, client_id: str, api_key: str):
             for html, current_url in results:
                 if not html: continue
                 visited.add(current_url)
-                
                 soup = BeautifulSoup(html, 'html.parser')
                 
-                # --- CAPTURE LINKS BEFORE DELETING NAV ---
                 base_domain = urlparse(url).netloc.replace("www.", "")
                 if not sitemap_urls:
                     for link in soup.find_all('a', href=True):
@@ -183,144 +177,92 @@ async def crawl_and_index(url: str, client_id: str, api_key: str):
                         if base_domain in full_url and full_url not in visited and full_url not in queue:
                              if not any(x in full_url for x in ['.jpg', '.png', 'login', 'admin']):
                                 queue.append(full_url)
-                # ----------------------------------------------
 
-                # Clean text
-                for script in soup(["script", "style", "nav", "footer", "iframe", "noscript"]): 
-                    script.extract()
+                for script in soup(["script", "style", "nav", "footer", "iframe", "noscript"]): script.extract()
                 text = soup.get_text(separator='\n', strip=True)
-                
-                if len(text) > 200:
-                    scraped_data.append({"url": current_url, "text": text})
+                if len(text) > 200: scraped_data.append({"url": current_url, "text": text})
 
     if not scraped_data: return False
 
-    # 3. Indexing
     try:
         genai.configure(api_key=api_key)
         vectors = []
         for page in scraped_data:
             chunks = smart_chunk_text(page['text'])
             for i, chunk in enumerate(chunks):
-                result = genai.embed_content(
-                    model="models/text-embedding-004", content=chunk, task_type="retrieval_document"
-                )
+                result = genai.embed_content(model="models/text-embedding-004", content=chunk, task_type="retrieval_document")
                 vector_id = f"{client_id}_{abs(hash(page['url']))}_{i}"
-                vectors.append({
-                    "id": vector_id,
-                    "values": result['embedding'],
-                    "metadata": {"text": chunk, "url": page['url']}
-                })
+                vectors.append({"id": vector_id, "values": result['embedding'], "metadata": {"text": chunk, "url": page['url']}})
 
         if vectors:
             batch_size = 50
             for i in range(0, len(vectors), batch_size):
                 index.upsert(vectors=vectors[i:i+batch_size], namespace=client_id)
-            
-            index.upsert(
-                vectors=[{
-                    "id": "config_SYNC",
-                    "values": [1.0] * 768, 
-                    "metadata": {"last_sync_timestamp": int(time.time())}
-                }],
-                namespace=client_id
-            )
+            index.upsert(vectors=[{"id": "config_SYNC", "values": [1.0] * 768, "metadata": {"last_sync_timestamp": int(time.time())}}], namespace=client_id)
             return True
-            
     except Exception as e:
         print(f"Indexing Error: {e}")
         return False
 
-# --- AUTO-DETECT MODEL ---
 def get_best_model():
-    try:
-        for m in genai.list_models():
-            if 'generateContent' in m.supported_generation_methods:
-                if 'flash' in m.name: return m.name
-        for m in genai.list_models():
-            if 'generateContent' in m.supported_generation_methods:
-                return m.name
-    except:
-        return "models/gemini-1.5-flash"
-    return "models/gemini-pro"
+    return "models/gemini-1.5-flash"
 
 # --- API ENDPOINTS ---
 @app.get("/")
-def home(): return {"status": "Ultra-Intelligent Brain Active"}
+def home(): return {"status": "SaaS Brain Active"}
 
+# 1. NEW TRAIN ENDPOINT (Accepts Name & Color)
 @app.post("/train")
 async def train_bot(request: TrainRequest):
-    success = await crawl_and_index(request.url, request.client_id, request.gemini_api_key)
+    success = await crawl_and_index(
+        request.url, 
+        request.client_id, 
+        request.gemini_api_key, 
+        request.bot_name, 
+        request.bot_color
+    )
     if success: return {"status": "success"}
     else: return {"status": "error"}
 
-@app.post("/trigger-sync")
-async def trigger_sync(request: AutoSyncRequest, background_tasks: BackgroundTasks):
-    api_key = get_client_key(request.client_id)
-    if not api_key: return {"status": "No Key Found"}
-    
-    fetch_response = index.fetch(ids=["config_SYNC"], namespace=request.client_id)
-    current_time = int(time.time())
-    should_sync = True
-    
-    if "config_SYNC" in fetch_response.vectors:
-        last_sync = int(fetch_response.vectors["config_SYNC"].metadata.get("last_sync_timestamp", 0))
-        if (current_time - last_sync) < 86400: should_sync = False
-    
-    if should_sync:
-        background_tasks.add_task(crawl_and_index, request.url, request.client_id, api_key)
-        return {"status": "Sync Started"}
-    return {"status": "Up to date"}
+# 2. NEW CONFIG ENDPOINT (Widget calls this to get looks)
+@app.get("/get-config")
+async def get_config(client_id: str):
+    config = get_client_config(client_id)
+    if config:
+        return {
+            "bot_name": config.get("bot_name", "AI Support"),
+            "bot_color": config.get("bot_color", "#4F46E5")
+        }
+    return {"bot_name": "Support", "bot_color": "#4F46E5"}
 
 @app.post("/chat")
 async def chat_bot(request: ChatRequest):
-    api_key = get_client_key(request.client_id)
-    if not api_key: return {"answer": "Security Error: Please re-train bot."}
-
+    config = get_client_config(request.client_id)
+    if not config: return {"answer": "Error: Bot not configured."}
+    
+    api_key = config.get("api_key")
     is_lead = check_and_save_lead(request.message, request.client_id)
 
     try:
         genai.configure(api_key=api_key)
-        embedding = genai.embed_content(
-            model="models/text-embedding-004", content=request.message, task_type="retrieval_query"
-        )['embedding']
-
-        search_results = index.query(
-            namespace=request.client_id, vector=embedding, top_k=5, include_metadata=True
-        )
-
+        embedding = genai.embed_content(model="models/text-embedding-004", content=request.message, task_type="retrieval_query")['embedding']
+        search_results = index.query(namespace=request.client_id, vector=embedding, top_k=5, include_metadata=True)
         context = "\n\n".join([f"SOURCE: {m['metadata'].get('url','')}\nTEXT: {m['metadata']['text']}" for m in search_results['matches']])
         
         base_url = f"https://{request.client_id}"
         
-        # --- THE SMART PROMPT (Includes Formatting Rules) ---
         system = f"""
-        You are a smart Sales Assistant for {request.client_id}.
-        
-        CONTEXT FROM WEBSITE:
-        {context}
-        
-        POTENTIAL NAVIGATION LINKS:
-        - Blogs: {base_url}/blog OR {base_url}/blogs
-        - Contact: {base_url}/contact OR {base_url}/contact-us
-        - Services: {base_url}/services
-        - About: {base_url}/about
-        
-        STRICT FORMATTING RULES:
-        1. NEVER write a raw URL like 'https://...'.
-        2. ALWAYS format links using Markdown: [Clickable Text](URL).
-           - BAD: Check this https://fcmedia.in/blogs
-           - GOOD: Check this [FC Media Blogs](https://fcmedia.in/blogs)
-        3. Use bullet points for lists.
-        
+        You are a smart assistant for {request.client_id}.
+        CONTEXT: {context}
+        POTENTIAL LINKS:
+        - Blogs: {base_url}/blog
+        - Contact: {base_url}/contact
         INSTRUCTIONS:
-        1. Answer based on context.
-        2. If user asks for links, use the Markdown format above.
-        3. If the user provided an email, acknowledge it politely.
+        1. Answer strictly based on context.
+        2. Use Markdown links: [Title](URL).
+        3. Be concise.
         """
-        
-        if is_lead:
-            system += "\nNOTE: The user just provided their email. Thank them and say someone will contact them soon."
+        if is_lead: system += "\n(User provided email. Confirm receipt.)"
 
         try:
             model = genai.GenerativeModel("models/gemini-1.5-flash")
@@ -333,21 +275,3 @@ async def chat_bot(request: ChatRequest):
 
     except Exception as e:
         return {"answer": f"Error: {str(e)}"}
-
-@app.post("/get-leads")
-async def get_leads(request: AutoSyncRequest):
-    try:
-        genai.configure(api_key=get_client_key(request.client_id))
-        dummy = genai.embed_content(model="models/text-embedding-004", content="mail", task_type="retrieval_query")['embedding']
-        results = index.query(namespace=request.client_id, vector=dummy, top_k=50, include_metadata=True, filter={"type": "lead"})
-        
-        leads = []
-        for m in results['matches']:
-            leads.append({
-                "email": m['metadata'].get('email'),
-                "message": m['metadata'].get('context'),
-                "date": m['metadata'].get('timestamp')
-            })
-        return {"leads": leads}
-    except:
-        return {"leads": []}

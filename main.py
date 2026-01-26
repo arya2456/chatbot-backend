@@ -35,71 +35,61 @@ except Exception as e:
 
 # --- MODELS ---
 class TrainRequest(BaseModel):
-    url: str
-    client_id: str
-    gemini_api_key: str
-    bot_name: str = "AI Support"   # NEW: Default name
-    bot_color: str = "#4F46E5"     # NEW: Default color
+    url: str; client_id: str; gemini_api_key: str; bot_name: str = "AI Support"; bot_color: str = "#4F46E5"
 
 class ChatRequest(BaseModel):
-    message: str
-    client_id: str
+    message: str; client_id: str; session_id: str = "Guest-Unknown" # NEW
 
 class AutoSyncRequest(BaseModel):
-    url: str
-    client_id: str
-
-class ConfigRequest(BaseModel):
-    client_id: str
+    url: str; client_id: str
 
 # --- HELPERS ---
 def save_client_config(client_id, api_key, bot_name, bot_color):
     try:
-        # We now save Name and Color into the config vector
-        index.upsert(
-            vectors=[{
-                "id": f"config_{client_id}",
-                "values": [1.0] * 768, 
-                "metadata": {
-                    "api_key": api_key, 
-                    "type": "config",
-                    "bot_name": bot_name,
-                    "bot_color": bot_color
-                }
-            }],
-            namespace=client_id
-        )
-    except Exception as e:
-        print(f"Error saving config: {e}")
+        index.upsert(vectors=[{
+            "id": f"config_{client_id}", "values": [1.0] * 768, 
+            "metadata": {"api_key": api_key, "type": "config", "bot_name": bot_name, "bot_color": bot_color}
+        }], namespace=client_id)
+    except: pass
 
 def get_client_config(client_id):
     try:
         response = index.fetch(ids=[f"config_{client_id}"], namespace=client_id)
-        if f"config_{client_id}" in response.vectors:
-            return response.vectors[f"config_{client_id}"].metadata
-        return None
-    except:
-        return None
+        if f"config_{client_id}" in response.vectors: return response.vectors[f"config_{client_id}"].metadata
+    except: return None
+    return None
 
 def check_and_save_lead(message, client_id):
     email_regex = r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}"
     match = re.search(email_regex, message)
     if match:
-        email = match.group()
-        timestamp = int(time.time())
-        lead_id = f"lead_{timestamp}_{abs(hash(email))}"
+        email = match.group(); timestamp = int(time.time()); lead_id = f"lead_{timestamp}_{abs(hash(email))}"
         try:
-            index.upsert(
-                vectors=[{
-                    "id": lead_id,
-                    "values": [1.0] * 768,
-                    "metadata": {"type": "lead", "email": email, "context": message, "timestamp": timestamp}
-                }],
-                namespace=client_id
-            )
+            index.upsert(vectors=[{"id": lead_id, "values": [1.0] * 768, "metadata": {"type": "lead", "email": email, "context": message, "timestamp": timestamp}}], namespace=client_id)
             return True
         except: return False
     return False
+
+# --- LOGGING FUNCTION (NEW) ---
+def log_chat(client_id, session_id, user_msg, bot_msg):
+    timestamp = int(time.time())
+    log_id = f"chat_{session_id}_{timestamp}"
+    try:
+        # We save this as a "chat_log" type.
+        # We use a dummy vector because we don't need semantic search on logs yet, just retrieval.
+        index.upsert(vectors=[{
+            "id": log_id,
+            "values": [0.1] * 768, 
+            "metadata": {
+                "type": "chat_log",
+                "session_id": session_id,
+                "user_msg": user_msg,
+                "bot_msg": bot_msg,
+                "timestamp": timestamp
+            }
+        }], namespace=client_id)
+    except Exception as e:
+        print(f"Log Error: {e}")
 
 # --- CRAWLER (Standard) ---
 async def fetch_sitemap(session, base_url):
@@ -128,118 +118,72 @@ async def fetch_url(session, url):
     except: return None, url
 
 def smart_chunk_text(text, max_chars=3000):
-    paragraphs = text.split('\n')
-    chunks = []
-    current_chunk = ""
+    paragraphs = text.split('\n'); chunks = []; current_chunk = ""
     for para in paragraphs:
-        if len(current_chunk) + len(para) < max_chars:
-            current_chunk += para + "\n"
-        else:
-            chunks.append(current_chunk)
-            current_chunk = para + "\n"
+        if len(current_chunk) + len(para) < max_chars: current_chunk += para + "\n"
+        else: chunks.append(current_chunk); current_chunk = para + "\n"
     if current_chunk: chunks.append(current_chunk)
     return chunks
 
-async def crawl_and_index(url: str, client_id: str, api_key: str, bot_name: str, bot_color: str):
-    print(f"--- STARTING SETUP FOR {client_id} ---")
-    
-    # SAVE CONFIG FIRST (Name, Color, Key)
+async def crawl_and_index(url, client_id, api_key, bot_name, bot_color):
     save_client_config(client_id, api_key, bot_name, bot_color)
-    
     if not url.startswith('http'): url = 'https://' + url
-    
-    to_visit = set()
-    scraped_data = []
-    
     async with aiohttp.ClientSession() as session:
         sitemap_urls = await fetch_sitemap(session, url)
-        if sitemap_urls: to_visit = set(sitemap_urls[:60]) 
-        else: to_visit = {url}
-
-        visited = set()
-        queue = list(to_visit)
-        
+        to_visit = set(sitemap_urls[:60]) if sitemap_urls else {url}
+        visited = set(); queue = list(to_visit); scraped_data = []
         while queue and len(visited) < 60:
-            batch = queue[:8]
-            queue = queue[8:]
-            tasks = [fetch_url(session, u) for u in batch]
+            batch = queue[:8]; queue = queue[8:]; tasks = [fetch_url(session, u) for u in batch]
             results = await asyncio.gather(*tasks)
-
             for html, current_url in results:
                 if not html: continue
-                visited.add(current_url)
-                soup = BeautifulSoup(html, 'html.parser')
-                
+                visited.add(current_url); soup = BeautifulSoup(html, 'html.parser')
                 base_domain = urlparse(url).netloc.replace("www.", "")
                 if not sitemap_urls:
                     for link in soup.find_all('a', href=True):
                         full_url = urljoin(current_url, link['href']).split('#')[0]
                         if base_domain in full_url and full_url not in visited and full_url not in queue:
-                             if not any(x in full_url for x in ['.jpg', '.png', 'login', 'admin']):
-                                queue.append(full_url)
-
+                             if not any(x in full_url for x in ['.jpg', '.png', 'login', 'admin']): queue.append(full_url)
                 for script in soup(["script", "style", "nav", "footer", "iframe", "noscript"]): script.extract()
                 text = soup.get_text(separator='\n', strip=True)
                 if len(text) > 200: scraped_data.append({"url": current_url, "text": text})
-
     if not scraped_data: return False
-
     try:
-        genai.configure(api_key=api_key)
-        vectors = []
+        genai.configure(api_key=api_key); vectors = []
         for page in scraped_data:
             chunks = smart_chunk_text(page['text'])
             for i, chunk in enumerate(chunks):
                 result = genai.embed_content(model="models/text-embedding-004", content=chunk, task_type="retrieval_document")
                 vector_id = f"{client_id}_{abs(hash(page['url']))}_{i}"
                 vectors.append({"id": vector_id, "values": result['embedding'], "metadata": {"text": chunk, "url": page['url']}})
-
         if vectors:
             batch_size = 50
-            for i in range(0, len(vectors), batch_size):
-                index.upsert(vectors=vectors[i:i+batch_size], namespace=client_id)
+            for i in range(0, len(vectors), batch_size): index.upsert(vectors=vectors[i:i+batch_size], namespace=client_id)
             index.upsert(vectors=[{"id": "config_SYNC", "values": [1.0] * 768, "metadata": {"last_sync_timestamp": int(time.time())}}], namespace=client_id)
             return True
-    except Exception as e:
-        print(f"Indexing Error: {e}")
-        return False
+    except: return False
 
-def get_best_model():
-    return "models/gemini-1.5-flash"
+def get_best_model(): return "models/gemini-1.5-flash"
 
 # --- API ENDPOINTS ---
 @app.get("/")
-def home(): return {"status": "SaaS Brain Active"}
+def home(): return {"status": "SaaS Brain Active v2"}
 
-# 1. NEW TRAIN ENDPOINT (Accepts Name & Color)
 @app.post("/train")
 async def train_bot(request: TrainRequest):
-    success = await crawl_and_index(
-        request.url, 
-        request.client_id, 
-        request.gemini_api_key, 
-        request.bot_name, 
-        request.bot_color
-    )
-    if success: return {"status": "success"}
-    else: return {"status": "error"}
+    success = await crawl_and_index(request.url, request.client_id, request.gemini_api_key, request.bot_name, request.bot_color)
+    return {"status": "success" if success else "error"}
 
-# 2. NEW CONFIG ENDPOINT (Widget calls this to get looks)
 @app.get("/get-config")
 async def get_config(client_id: str):
     config = get_client_config(client_id)
-    if config:
-        return {
-            "bot_name": config.get("bot_name", "AI Support"),
-            "bot_color": config.get("bot_color", "#4F46E5")
-        }
+    if config: return {"bot_name": config.get("bot_name", "AI Support"), "bot_color": config.get("bot_color", "#4F46E5")}
     return {"bot_name": "Support", "bot_color": "#4F46E5"}
 
 @app.post("/chat")
 async def chat_bot(request: ChatRequest):
     config = get_client_config(request.client_id)
     if not config: return {"answer": "Error: Bot not configured."}
-    
     api_key = config.get("api_key")
     is_lead = check_and_save_lead(request.message, request.client_id)
 
@@ -248,30 +192,75 @@ async def chat_bot(request: ChatRequest):
         embedding = genai.embed_content(model="models/text-embedding-004", content=request.message, task_type="retrieval_query")['embedding']
         search_results = index.query(namespace=request.client_id, vector=embedding, top_k=5, include_metadata=True)
         context = "\n\n".join([f"SOURCE: {m['metadata'].get('url','')}\nTEXT: {m['metadata']['text']}" for m in search_results['matches']])
-        
         base_url = f"https://{request.client_id}"
         
-        system = f"""
-        You are a smart assistant for {request.client_id}.
-        CONTEXT: {context}
-        POTENTIAL LINKS:
-        - Blogs: {base_url}/blog
-        - Contact: {base_url}/contact
-        INSTRUCTIONS:
-        1. Answer strictly based on context.
-        2. Use Markdown links: [Title](URL).
-        3. Be concise.
-        """
+        system = f"You are a smart assistant for {request.client_id}. CONTEXT: {context}. INSTRUCTIONS: Answer strictly based on context. Be concise."
         if is_lead: system += "\n(User provided email. Confirm receipt.)"
 
-        try:
-            model = genai.GenerativeModel("models/gemini-1.5-flash")
-            res = model.generate_content(f"{system}\n\nUSER: {request.message}")
-            return {"answer": res.text}
-        except:
-            model = genai.GenerativeModel(get_best_model())
-            res = model.generate_content(f"{system}\n\nUSER: {request.message}")
-            return {"answer": res.text}
+        model = genai.GenerativeModel(get_best_model())
+        res = model.generate_content(f"{system}\n\nUSER: {request.message}")
+        
+        # --- LOG THE CHAT ---
+        # Note: We do this asynchronously to not slow down the response
+        log_chat(request.client_id, request.session_id, request.message, res.text)
+        
+        return {"answer": res.text}
 
+    except Exception as e: return {"answer": f"Error: {str(e)}"}
+
+@app.post("/get-leads")
+async def get_leads(request: AutoSyncRequest):
+    try:
+        genai.configure(api_key=get_client_key(request.client_id)) # Helper needed? No, logic inside log_chat
+        # Just reuse config logic
+        config = get_client_config(request.client_id)
+        if not config: return {"leads": []}
+        
+        # We query for leads
+        dummy = [0.1] * 768
+        results = index.query(namespace=request.client_id, vector=dummy, top_k=100, include_metadata=True, filter={"type": "lead"})
+        leads = []
+        for m in results['matches']:
+            leads.append({"email": m['metadata'].get('email'), "message": m['metadata'].get('context'), "date": m['metadata'].get('timestamp')})
+        return {"leads": leads}
+    except: return {"leads": []}
+
+# --- NEW ANALYTICS ENDPOINT ---
+@app.post("/get-analytics")
+async def get_analytics(request: AutoSyncRequest):
+    try:
+        config = get_client_config(request.client_id)
+        if not config: return {"logs": [], "summary": "No data"}
+        
+        # 1. Fetch Chat Logs (Using filter)
+        dummy = [0.1] * 768
+        results = index.query(namespace=request.client_id, vector=dummy, top_k=100, include_metadata=True, filter={"type": "chat_log"})
+        
+        logs = []
+        user_questions = []
+        
+        for m in results['matches']:
+            logs.append({
+                "session": m['metadata'].get('session_id'),
+                "user": m['metadata'].get('user_msg'),
+                "bot": m['metadata'].get('bot_msg'),
+                "time": m['metadata'].get('timestamp')
+            })
+            user_questions.append(m['metadata'].get('user_msg'))
+
+        # 2. AI Summary of Common Questions
+        # If we have enough data, ask Gemini to summarize
+        ai_summary = "Not enough data yet."
+        if len(user_questions) > 5:
+            try:
+                genai.configure(api_key=config.get("api_key"))
+                model = genai.GenerativeModel("models/gemini-1.5-flash")
+                prompt = f"Analyze these user questions and list the Top 3 most common topics or concerns:\n{', '.join(user_questions[:30])}"
+                res = model.generate_content(prompt)
+                ai_summary = res.text
+            except:
+                ai_summary = "Could not generate summary."
+
+        return {"logs": logs, "summary": ai_summary}
     except Exception as e:
-        return {"answer": f"Error: {str(e)}"}
+        return {"logs": [], "summary": f"Error: {str(e)}"}

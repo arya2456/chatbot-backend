@@ -13,9 +13,8 @@ from pinecone import Pinecone
 import google.generativeai as genai
 
 # --- CONFIGURATION ---
-# It is highly recommended to set these in your environment variables
 PINECONE_INDEX_NAME = "chatbot-index"
-PINECONE_API_KEY = os.getenv("PINECONE_API_KEY") 
+PINECONE_API_KEY = os.getenv("PINECONE_API_KEY", "pcsk_2Nqmmq_MaJE7qaPCmboMMTC6gLsC8w7Ahx826mLb5a5Lx4vtfKx74zAF7iLhiZHjq3qE2W")
 
 app = FastAPI()
 
@@ -29,6 +28,7 @@ app.add_middleware(
 
 # --- DATABASE ---
 try:
+    # Using the new Pinecone syntax (v3.0+)
     pc = Pinecone(api_key=PINECONE_API_KEY)
     index = pc.Index(PINECONE_INDEX_NAME)
 except Exception as e:
@@ -53,16 +53,6 @@ class AutoSyncRequest(BaseModel):
     client_id: str
 
 # --- HELPERS ---
-def get_embedding(text: str, task_type: str = "retrieval_query"):
-    """Helper to fetch embeddings using the correct model name."""
-    # models/text-embedding-004 is the standard 768-dim model for 2026
-    result = genai.embed_content(
-        model="models/text-embedding-004",
-        content=text,
-        task_type=task_type
-    )
-    return result['embedding']
-
 def save_client_config(client_id, api_key, bot_name, bot_color, bot_avatar):
     try:
         index.upsert(
@@ -211,10 +201,10 @@ async def crawl_and_index(url, client_id, api_key, bot_name, bot_color, bot_avat
         for page in scraped_data:
             chunks = smart_chunk_text(page['text'])
             for i, chunk in enumerate(chunks):
-                # Using the fixed text-embedding-004
-                embedding = get_embedding(chunk, task_type="retrieval_document")
+                # *** FIX: Downgrade to 'embedding-001' (Universal Support) ***
+                result = genai.embed_content(model="models/embedding-001", content=chunk, task_type="retrieval_document")
                 vector_id = f"{client_id}_{abs(hash(page['url']))}_{i}"
-                vectors.append({"id": vector_id, "values": embedding, "metadata": {"text": chunk, "url": page['url']}})
+                vectors.append({"id": vector_id, "values": result['embedding'], "metadata": {"text": chunk, "url": page['url']}})
 
         if vectors:
             batch_size = 50
@@ -227,13 +217,13 @@ async def crawl_and_index(url, client_id, api_key, bot_name, bot_color, bot_avat
         return False
 
 def get_best_model():
-    # Upgraded to 2.0 Flash for superior performance
-    return "models/gemini-2.0-flash"
+    # *** FIX: Use 'gemini-1.5-flash' (Most Stable) ***
+    return "models/gemini-1.5-flash"
 
 # --- API ENDPOINTS ---
 
 @app.get("/")
-def home(): return {"status": "Chatbot Engine Active", "version": "2.1", "model": "Gemini 2.0 Flash"}
+def home(): return {"status": "FC Brain Active (Stable Mode)"}
 
 @app.post("/train")
 async def train_bot(request: TrainRequest):
@@ -257,16 +247,15 @@ async def get_config(client_id: str):
 @app.post("/chat")
 async def chat_bot(request: ChatRequest):
     config = get_client_config(request.client_id)
-    if not config: return {"answer": "Error: Bot not configured. Please train the bot first."}
+    if not config: return {"answer": "Error: Bot not configured."}
     
     api_key = config.get("api_key")
     is_lead = check_and_save_lead(request.message, request.client_id)
 
     try:
         genai.configure(api_key=api_key)
-        
-        # Use helper for query embedding
-        embedding = get_embedding(request.message, task_type="retrieval_query")
+        # *** FIX: Use 'embedding-001' for queries too ***
+        embedding = genai.embed_content(model="models/embedding-001", content=request.message, task_type="retrieval_query")['embedding']
         
         search_results = index.query(namespace=request.client_id, vector=embedding, top_k=5, include_metadata=True)
         context = "\n\n".join([f"SOURCE: {m['metadata'].get('url','')}\nTEXT: {m['metadata']['text']}" for m in search_results['matches']])
@@ -275,12 +264,11 @@ async def chat_bot(request: ChatRequest):
         You are a smart assistant for {request.client_id}.
         CONTEXT: {context}
         INSTRUCTIONS:
-        1. Answer strictly based on the provided context.
-        2. If the answer isn't in the context, say you don't know politely.
-        3. Use Markdown links for sources: [Title](URL).
-        4. Be helpful and concise.
+        1. Answer strictly based on context.
+        2. Use Markdown links: [Title](URL).
+        3. Be concise.
         """
-        if is_lead: system += "\n(User provided contact details. Acknowledge this politely.)"
+        if is_lead: system += "\n(User provided email. Confirm receipt.)"
 
         model = genai.GenerativeModel(get_best_model())
         res = model.generate_content(f"{system}\n\nUSER: {request.message}")
@@ -290,7 +278,7 @@ async def chat_bot(request: ChatRequest):
         return {"answer": res.text}
 
     except Exception as e:
-        return {"answer": f"Service Error: {str(e)}"}
+        return {"answer": f"Error: {str(e)}"}
 
 @app.post("/get-leads")
 async def get_leads(request: AutoSyncRequest):
@@ -332,11 +320,11 @@ async def get_analytics(request: AutoSyncRequest):
         if len(user_questions) > 5:
             try:
                 genai.configure(api_key=config.get("api_key"))
-                model = genai.GenerativeModel(get_best_model())
-                prompt = f"Summarize the Top 3 needs based on these user questions:\n{', '.join(user_questions[:30])}"
+                model = genai.GenerativeModel("models/gemini-1.5-flash")
+                prompt = f"Analyze these user questions and list Top 3 common topics:\n{', '.join(user_questions[:30])}"
                 res = model.generate_content(prompt)
                 ai_summary = res.text
-            except: ai_summary = "Analysis currently unavailable."
+            except: ai_summary = "Analysis unavailable."
 
         return {"logs": logs, "summary": ai_summary}
     except Exception as e:

@@ -28,7 +28,6 @@ app.add_middleware(
 
 # --- DATABASE ---
 try:
-    # Using the new Pinecone syntax (v3.0+)
     pc = Pinecone(api_key=PINECONE_API_KEY)
     index = pc.Index(PINECONE_INDEX_NAME)
 except Exception as e:
@@ -201,7 +200,7 @@ async def crawl_and_index(url, client_id, api_key, bot_name, bot_color, bot_avat
         for page in scraped_data:
             chunks = smart_chunk_text(page['text'])
             for i, chunk in enumerate(chunks):
-                # *** FIX: Downgrade to 'embedding-001' (Universal Support) ***
+                # *** STRICTLY USE 'embedding-001' ***
                 result = genai.embed_content(model="models/embedding-001", content=chunk, task_type="retrieval_document")
                 vector_id = f"{client_id}_{abs(hash(page['url']))}_{i}"
                 vectors.append({"id": vector_id, "values": result['embedding'], "metadata": {"text": chunk, "url": page['url']}})
@@ -217,13 +216,13 @@ async def crawl_and_index(url, client_id, api_key, bot_name, bot_color, bot_avat
         return False
 
 def get_best_model():
-    # *** FIX: Use 'gemini-1.5-flash' (Most Stable) ***
+    # *** STRICTLY USE 'gemini-1.5-flash' ***
     return "models/gemini-1.5-flash"
 
 # --- API ENDPOINTS ---
 
 @app.get("/")
-def home(): return {"status": "FC Brain Active (Stable Mode)"}
+def home(): return {"status": "FC Brain SAFE MODE (Gemini 1.5)"}
 
 @app.post("/train")
 async def train_bot(request: TrainRequest):
@@ -254,7 +253,7 @@ async def chat_bot(request: ChatRequest):
 
     try:
         genai.configure(api_key=api_key)
-        # *** FIX: Use 'embedding-001' for queries too ***
+        # *** STRICTLY USE 'embedding-001' ***
         embedding = genai.embed_content(model="models/embedding-001", content=request.message, task_type="retrieval_query")['embedding']
         
         search_results = index.query(namespace=request.client_id, vector=embedding, top_k=5, include_metadata=True)
@@ -320,7 +319,7 @@ async def get_analytics(request: AutoSyncRequest):
         if len(user_questions) > 5:
             try:
                 genai.configure(api_key=config.get("api_key"))
-                model = genai.GenerativeModel("models/gemini-1.5-flash")
+                model = genai.GenerativeModel(get_best_model())
                 prompt = f"Analyze these user questions and list Top 3 common topics:\n{', '.join(user_questions[:30])}"
                 res = model.generate_content(prompt)
                 ai_summary = res.text

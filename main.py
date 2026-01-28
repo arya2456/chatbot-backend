@@ -40,7 +40,7 @@ class TrainRequest(BaseModel):
     gemini_api_key: str
     bot_name: str = "AI Support"
     bot_color: str = "#4F46E5"
-    bot_avatar: str = ""  # NEW: Stores the Avatar URL
+    bot_avatar: str = ""
 
 class ChatRequest(BaseModel):
     message: str
@@ -200,7 +200,8 @@ async def crawl_and_index(url, client_id, api_key, bot_name, bot_color, bot_avat
         for page in scraped_data:
             chunks = smart_chunk_text(page['text'])
             for i, chunk in enumerate(chunks):
-                result = genai.embed_content(model="models/text-embedding-004", content=chunk, task_type="retrieval_document")
+                # *** STRICTLY USE 'embedding-001' ***
+                result = genai.embed_content(model="models/embedding-001", content=chunk, task_type="retrieval_document")
                 vector_id = f"{client_id}_{abs(hash(page['url']))}_{i}"
                 vectors.append({"id": vector_id, "values": result['embedding'], "metadata": {"text": chunk, "url": page['url']}})
 
@@ -215,12 +216,13 @@ async def crawl_and_index(url, client_id, api_key, bot_name, bot_color, bot_avat
         return False
 
 def get_best_model():
+    # *** STRICTLY USE 'gemini-1.5-flash' ***
     return "models/gemini-1.5-flash"
 
 # --- API ENDPOINTS ---
 
 @app.get("/")
-def home(): return {"status": "FC Brain Active v3 (Avatar Support)"}
+def home(): return {"status": "FC Brain SAFE MODE (Gemini 1.5)"}
 
 @app.post("/train")
 async def train_bot(request: TrainRequest):
@@ -237,7 +239,7 @@ async def get_config(client_id: str):
         return {
             "bot_name": config.get("bot_name", "AI Support"),
             "bot_color": config.get("bot_color", "#4F46E5"),
-            "bot_avatar": config.get("bot_avatar", "") # NEW
+            "bot_avatar": config.get("bot_avatar", "") 
         }
     return {"bot_name": "Support", "bot_color": "#4F46E5", "bot_avatar": ""}
 
@@ -251,11 +253,11 @@ async def chat_bot(request: ChatRequest):
 
     try:
         genai.configure(api_key=api_key)
-        embedding = genai.embed_content(model="models/text-embedding-004", content=request.message, task_type="retrieval_query")['embedding']
+        # *** STRICTLY USE 'embedding-001' ***
+        embedding = genai.embed_content(model="models/embedding-001", content=request.message, task_type="retrieval_query")['embedding']
+        
         search_results = index.query(namespace=request.client_id, vector=embedding, top_k=5, include_metadata=True)
         context = "\n\n".join([f"SOURCE: {m['metadata'].get('url','')}\nTEXT: {m['metadata']['text']}" for m in search_results['matches']])
-        
-        base_url = f"https://{request.client_id}"
         
         system = f"""
         You are a smart assistant for {request.client_id}.
@@ -270,7 +272,6 @@ async def chat_bot(request: ChatRequest):
         model = genai.GenerativeModel(get_best_model())
         res = model.generate_content(f"{system}\n\nUSER: {request.message}")
         
-        # Log conversation for Analytics
         log_chat(request.client_id, request.session_id, request.message, res.text)
         
         return {"answer": res.text}
@@ -318,7 +319,7 @@ async def get_analytics(request: AutoSyncRequest):
         if len(user_questions) > 5:
             try:
                 genai.configure(api_key=config.get("api_key"))
-                model = genai.GenerativeModel("models/gemini-1.5-flash")
+                model = genai.GenerativeModel(get_best_model())
                 prompt = f"Analyze these user questions and list Top 3 common topics:\n{', '.join(user_questions[:30])}"
                 res = model.generate_content(prompt)
                 ai_summary = res.text

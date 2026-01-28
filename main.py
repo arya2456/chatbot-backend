@@ -28,7 +28,7 @@ app.add_middleware(
 
 # --- DATABASE ---
 try:
-    # Use the new Pinecone v3.0 syntax
+    # Uses Pinecone v3.0+ syntax
     pc = Pinecone(api_key=PINECONE_API_KEY)
     index = pc.Index(PINECONE_INDEX_NAME)
 except Exception as e:
@@ -58,6 +58,7 @@ def save_client_config(client_id, api_key, bot_name, bot_color, bot_avatar):
         index.upsert(
             vectors=[{
                 "id": f"config_{client_id}",
+                # 768 dimensions compatible with gemini-embedding-001
                 "values": [1.0] * 768, 
                 "metadata": {
                     "api_key": api_key, 
@@ -201,8 +202,8 @@ async def crawl_and_index(url, client_id, api_key, bot_name, bot_color, bot_avat
         for page in scraped_data:
             chunks = smart_chunk_text(page['text'])
             for i, chunk in enumerate(chunks):
-                # USE THE MODERN MODEL (Supported by new library)
-                result = genai.embed_content(model="models/text-embedding-004", content=chunk, task_type="retrieval_document")
+                # *** FIX: Use 'embedding-001' (768 dim, stable) ***
+                result = genai.embed_content(model="models/embedding-001", content=chunk, task_type="retrieval_document")
                 vector_id = f"{client_id}_{abs(hash(page['url']))}_{i}"
                 vectors.append({"id": vector_id, "values": result['embedding'], "metadata": {"text": chunk, "url": page['url']}})
 
@@ -217,12 +218,13 @@ async def crawl_and_index(url, client_id, api_key, bot_name, bot_color, bot_avat
         return False
 
 def get_best_model():
-    return "models/gemini-1.5-flash"
+    # *** UPDATE: Upgraded to Gemini 2.0 Flash ***
+    return "models/gemini-2.0-flash"
 
 # --- API ENDPOINTS ---
 
 @app.get("/")
-def home(): return {"status": "FC Brain Active v4"}
+def home(): return {"status": "FC Brain Active (Gemini 2.0 + Embedding-001)"}
 
 @app.post("/train")
 async def train_bot(request: TrainRequest):
@@ -253,8 +255,8 @@ async def chat_bot(request: ChatRequest):
 
     try:
         genai.configure(api_key=api_key)
-        # USE THE MODERN MODEL
-        embedding = genai.embed_content(model="models/text-embedding-004", content=request.message, task_type="retrieval_query")['embedding']
+        # *** FIX: Use 'embedding-001' for queries too ***
+        embedding = genai.embed_content(model="models/embedding-001", content=request.message, task_type="retrieval_query")['embedding']
         
         search_results = index.query(namespace=request.client_id, vector=embedding, top_k=5, include_metadata=True)
         context = "\n\n".join([f"SOURCE: {m['metadata'].get('url','')}\nTEXT: {m['metadata']['text']}" for m in search_results['matches']])
@@ -319,7 +321,7 @@ async def get_analytics(request: AutoSyncRequest):
         if len(user_questions) > 5:
             try:
                 genai.configure(api_key=config.get("api_key"))
-                model = genai.GenerativeModel("models/gemini-1.5-flash")
+                model = genai.GenerativeModel(get_best_model())
                 prompt = f"Analyze these user questions and list Top 3 common topics:\n{', '.join(user_questions[:30])}"
                 res = model.generate_content(prompt)
                 ai_summary = res.text

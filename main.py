@@ -28,6 +28,7 @@ app.add_middleware(
 
 # --- DATABASE ---
 try:
+    # Use the new Pinecone v3.0 syntax
     pc = Pinecone(api_key=PINECONE_API_KEY)
     index = pc.Index(PINECONE_INDEX_NAME)
 except Exception as e:
@@ -158,7 +159,6 @@ def smart_chunk_text(text, max_chars=3000):
     return chunks
 
 async def crawl_and_index(url, client_id, api_key, bot_name, bot_color, bot_avatar):
-    # 1. Save Config FIRST
     save_client_config(client_id, api_key, bot_name, bot_color, bot_avatar)
     
     if not url.startswith('http'): url = 'https://' + url
@@ -201,7 +201,7 @@ async def crawl_and_index(url, client_id, api_key, bot_name, bot_color, bot_avat
         for page in scraped_data:
             chunks = smart_chunk_text(page['text'])
             for i, chunk in enumerate(chunks):
-                # *** FIX: Use Modern Model with Updated Library ***
+                # USE THE MODERN MODEL (Supported by new library)
                 result = genai.embed_content(model="models/text-embedding-004", content=chunk, task_type="retrieval_document")
                 vector_id = f"{client_id}_{abs(hash(page['url']))}_{i}"
                 vectors.append({"id": vector_id, "values": result['embedding'], "metadata": {"text": chunk, "url": page['url']}})
@@ -222,7 +222,7 @@ def get_best_model():
 # --- API ENDPOINTS ---
 
 @app.get("/")
-def home(): return {"status": "FC Brain Active (Latest GenAI)"}
+def home(): return {"status": "FC Brain Active v4"}
 
 @app.post("/train")
 async def train_bot(request: TrainRequest):
@@ -253,7 +253,7 @@ async def chat_bot(request: ChatRequest):
 
     try:
         genai.configure(api_key=api_key)
-        # *** FIX: Use Modern Model for Query ***
+        # USE THE MODERN MODEL
         embedding = genai.embed_content(model="models/text-embedding-004", content=request.message, task_type="retrieval_query")['embedding']
         
         search_results = index.query(namespace=request.client_id, vector=embedding, top_k=5, include_metadata=True)

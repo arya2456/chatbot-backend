@@ -3,7 +3,7 @@ uvicorn
 pydantic
 requests
 beautifulsoup4
-pinecone
-google-generativeai>=0.7.2
+pinecone-client>=3.0.0
+google-generativeai>=0.8.0
 python-multipart
 aiohttp

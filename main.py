@@ -16,7 +16,7 @@ import google.generativeai as genai
 PINECONE_INDEX_NAME = "chatbot-index"
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY", "pcsk_2Nqmmq_MaJE7qaPCmboMMTC6gLsC8w7Ahx826mLb5a5Lx4vtfKx74zAF7iLhiZHjq3qE2W")
 
-app = FastAPI(title="FC Brain Chatbot")
+app = FastAPI(title="FC Super-Brain Chatbot")
 
 app.add_middleware(
     CORSMiddleware,
@@ -41,6 +41,7 @@ class TrainRequest(BaseModel):
     bot_name: str = "AI Support"
     bot_color: str = "#4F46E5"
     bot_avatar: str = ""
+    bot_personality: str = "Helpful and professional" # [NEW] Teacher Mode
 
 class ChatRequest(BaseModel):
     message: str
@@ -52,7 +53,9 @@ class AutoSyncRequest(BaseModel):
     client_id: str
 
 # --- HELPERS ---
-def save_client_config(client_id, api_key, bot_name, bot_color, bot_avatar):
+
+def save_client_config(client_id, api_key, bot_name, bot_color, bot_avatar, bot_personality):
+    """Saves Client Config + Personality"""
     try:
         index.upsert(
             vectors=[{
@@ -63,7 +66,8 @@ def save_client_config(client_id, api_key, bot_name, bot_color, bot_avatar):
                     "type": "config",
                     "bot_name": bot_name,
                     "bot_color": bot_color,
-                    "bot_avatar": bot_avatar
+                    "bot_avatar": bot_avatar,
+                    "bot_personality": bot_personality
                 }
             }],
             namespace=client_id
@@ -100,13 +104,37 @@ def check_and_save_lead(message, client_id):
         except: return False
     return False
 
+def get_chat_history(client_id, session_id):
+    """ [NEW] MEMORY: Fetches last 3 interactions """
+    try:
+        # Dummy query to find recent chat logs (metadata filter)
+        results = index.query(
+            namespace=client_id,
+            vector=[0.01] * 768,
+            top_k=3,
+            include_metadata=True,
+            filter={"type": "chat_log", "session_id": session_id}
+        )
+        # Sort by timestamp (oldest first)
+        sorted_matches = sorted(results['matches'], key=lambda x: x['metadata'].get('timestamp', 0))
+        
+        history_text = ""
+        for m in sorted_matches:
+            user = m['metadata'].get('user_msg', '')
+            bot = m['metadata'].get('bot_msg', '')
+            if user and bot:
+                history_text += f"User: {user}\nAI: {bot}\n"
+        return history_text
+    except:
+        return ""
+
 def log_chat(client_id, session_id, user_msg, bot_msg):
     try:
         log_id = f"chat_{session_id}_{int(time.time())}"
         index.upsert(
             vectors=[{
                 "id": log_id,
-                "values": [0.1] * 768,
+                "values": [0.01] * 768, # Dummy vector for metadata storage
                 "metadata": {
                     "type": "chat_log",
                     "session_id": session_id,
@@ -120,12 +148,10 @@ def log_chat(client_id, session_id, user_msg, bot_msg):
     except Exception as e:
         print(f"Log Error: {e}")
 
-# --- EMBEDDING HELPER (MODERN MODEL) ---
+# --- EMBEDDING HELPER ---
 def get_embedding(text: str, client_api_key: str, task_type: str = "retrieval_document"):
     genai.configure(api_key=client_api_key)
-    
-    # *** CRITICAL FIX: Use the MODERN model which has quota ***
-    # The old model (embedding-001) has Limit 0 (Banned)
+    # Using text-embedding-004 (Modern Model)
     result = genai.embed_content(
         model="models/text-embedding-004",
         content=text,
@@ -134,7 +160,7 @@ def get_embedding(text: str, client_api_key: str, task_type: str = "retrieval_do
     return result['embedding']
 
 def get_best_model():
-    return "models/gemini-2.5-flash"
+    return "models/gemini-2.0-flash"
 
 # --- CRAWLER LOGIC ---
 async def fetch_sitemap(session, base_url):
@@ -176,8 +202,9 @@ def smart_chunk_text(text, max_chars=3000):
     if current: chunks.append(current.strip())
     return chunks
 
-async def crawl_and_index(url, client_id, api_key, bot_name, bot_color, bot_avatar):
-    save_client_config(client_id, api_key, bot_name, bot_color, bot_avatar)
+async def crawl_and_index(url, client_id, api_key, bot_name, bot_color, bot_avatar, bot_personality):
+    # Save Config with Personality
+    save_client_config(client_id, api_key, bot_name, bot_color, bot_avatar, bot_personality)
     
     if not url.startswith('http'): url = 'https://' + url
     
@@ -217,7 +244,7 @@ async def crawl_and_index(url, client_id, api_key, bot_name, bot_color, bot_avat
         for page in scraped_data:
             chunks = smart_chunk_text(page['text'])
             for i, chunk in enumerate(chunks):
-                # USE MODERN MODEL
+                # Use Client Key
                 embedding = get_embedding(text=chunk, client_api_key=api_key, task_type="retrieval_document")
                 vector_id = f"{client_id}_{abs(hash(page['url']))}_{i}"
                 vectors.append({"id": vector_id, "values": embedding, "metadata": {"text": chunk, "url": page['url']}})
@@ -235,13 +262,13 @@ async def crawl_and_index(url, client_id, api_key, bot_name, bot_color, bot_avat
 # --- API ENDPOINTS ---
 
 @app.get("/")
-def home(): return {"status": "FC Brain Active (Modern Model)"}
+def home(): return {"status": "FC Super-Brain Active (Memory + Links + Active Lead Gen)"}
 
 @app.post("/train")
 async def train_bot(request: TrainRequest):
     success = await crawl_and_index(
         request.url, request.client_id, request.gemini_api_key, 
-        request.bot_name, request.bot_color, request.bot_avatar
+        request.bot_name, request.bot_color, request.bot_avatar, request.bot_personality
     )
     return {"status": "success" if success else "failed"}
 
@@ -258,24 +285,54 @@ async def get_config(client_id: str):
 
 @app.post("/chat")
 async def chat_bot(request: ChatRequest):
+    # 1. Load Config
     config = get_client_config(request.client_id)
-    if not config: return {"answer": "Error: Bot not configured. Run training."}
+    if not config: return {"answer": "Error: Bot not configured."}
     
     client_api_key = config.get("api_key")
+    bot_personality = config.get("bot_personality", "Helpful and polite")
     if not client_api_key: return {"answer": "Error: Client API Key missing."}
 
+    # 2. Check for Lead
     is_lead = check_and_save_lead(request.message, request.client_id)
+
+    # 3. [NEW] Fetch Memory (Context Awareness)
+    history = get_chat_history(request.client_id, request.session_id)
 
     try:
         genai.configure(api_key=client_api_key)
-        # USE MODERN MODEL
-        embedding = get_embedding(text=request.message, client_api_key=client_api_key, task_type="retrieval_query")
         
+        # 4. Generate Embedding & Search
+        embedding = get_embedding(text=request.message, client_api_key=client_api_key, task_type="retrieval_query")
         search_results = index.query(namespace=request.client_id, vector=embedding, top_k=5, include_metadata=True)
+        
         context = "\n\n".join([f"SOURCE: {m['metadata'].get('url','')}\nTEXT: {m['metadata']['text']}" for m in search_results['matches']])
         
-        system = f"You are a helpful assistant for {request.client_id}. CONTEXT: {context}. INSTRUCTIONS: Answer strictly based on context. Be concise."
-        if is_lead: system += "\n(User provided email. Confirm receipt.)"
+        # 5. [NEW] Super System Prompt
+        system = f"""
+        You are a smart AI assistant for {request.client_id}.
+        
+        YOUR PERSONALITY: {bot_personality}
+        
+        KNOWLEDGE BASE:
+        {context}
+        
+        RECENT CHAT HISTORY:
+        {history}
+        
+        INSTRUCTIONS:
+        1. Answer strictly based on the KNOWLEDGE BASE. 
+        2. [IMPORTANT] If you give a contact, blog, or page reference, YOU MUST format it as a clickable Markdown link: [Link Text](URL).
+        3. [IMPORTANT] If the user's question is NOT answered by the Knowledge Base, reply exactly: "I don't have that information. Would you like to contact our team?"
+        4. Be concise and natural.
+        """
+        
+        # 6. [NEW] Active Lead Generation (Ask for email if not given yet)
+        # We append this instruction if the chat history is getting long (>2 turns) and we haven't captured a lead yet.
+        if len(history) > 200 and not is_lead: 
+            system += "\n[HIDDEN GOAL] If you answer the question successfully, politely ask: 'By the way, I can send more details to your inbox. What is your email address?'"
+        
+        if is_lead: system += "\n(User provided email. Confirm receipt nicely.)"
 
         model = genai.GenerativeModel(get_best_model())
         response = model.generate_content(f"{system}\n\nUSER: {request.message}")

@@ -134,7 +134,7 @@ def get_embedding(text: str, client_api_key: str, task_type: str = "retrieval_do
     return result['embedding']
 
 def get_best_model():
-    return "models/gemini-1.5-flash"
+    return "models/gemini-2.5-flash"
 
 # --- CRAWLER LOGIC ---
 async def fetch_sitemap(session, base_url):

@@ -3,17 +3,18 @@ import asyncio
 import aiohttp
 import time
 import re
-import xml.etree.ElementTree as ET
 from urllib.parse import urlparse, urljoin
 from bs4 import BeautifulSoup
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from pinecone import Pinecone
 import google.generativeai as genai
+import xml.etree.ElementTree as ET
 
 # --- CONFIGURATION ---
 PINECONE_INDEX_NAME = "chatbot-index"
+# This is the ONLY key you pay for (Database storage), which is tiny/free.
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY", "pcsk_2Nqmmq_MaJE7qaPCmboMMTC6gLsC8w7Ahx826mLb5a5Lx4vtfKx74zAF7iLhiZHjq3qE2W")
 
 app = FastAPI(title="FC Brain Chatbot")
@@ -37,7 +38,7 @@ except Exception as e:
 class TrainRequest(BaseModel):
     url: str
     client_id: str
-    gemini_api_key: str
+    gemini_api_key: str  # <--- THIS IS THE CLIENT'S KEY FROM DASHBOARD
     bot_name: str = "AI Support"
     bot_color: str = "#4F46E5"
     bot_avatar: str = ""
@@ -53,13 +54,14 @@ class AutoSyncRequest(BaseModel):
 
 # --- HELPERS ---
 def save_client_config(client_id, api_key, bot_name, bot_color, bot_avatar):
+    """Saves the Client's API Key into the Database securely"""
     try:
         index.upsert(
             vectors=[{
                 "id": f"config_{client_id}",
                 "values": [1.0] * 768, 
                 "metadata": {
-                    "api_key": api_key, 
+                    "api_key": api_key,  # Storing Client's specific key
                     "type": "config",
                     "bot_name": bot_name,
                     "bot_color": bot_color,
@@ -72,6 +74,7 @@ def save_client_config(client_id, api_key, bot_name, bot_color, bot_avatar):
         print(f"Config Error: {e}")
 
 def get_client_config(client_id):
+    """Retrieves the specific Client's API Key"""
     try:
         response = index.fetch(ids=[f"config_{client_id}"], namespace=client_id)
         if f"config_{client_id}" in response.vectors:
@@ -120,9 +123,13 @@ def log_chat(client_id, session_id, user_msg, bot_msg):
     except Exception as e:
         print(f"Log Error: {e}")
 
-# --- EMBEDDING HELPER (FORCE SAFE MODEL) ---
-def get_embedding(text: str, task_type: str = "retrieval_document"):
-    # We FORCE 'embedding-001' to avoid Server Errors/404s
+# --- DYNAMIC EMBEDDING HELPER ---
+def get_embedding(text: str, client_api_key: str, task_type: str = "retrieval_document"):
+    """Uses the CLIENT'S specific API Key to generate embeddings"""
+    # 1. Switch to Client's Key
+    genai.configure(api_key=client_api_key)
+    
+    # 2. Use Safe Model
     result = genai.embed_content(
         model="models/embedding-001",
         content=text,
@@ -174,6 +181,7 @@ def smart_chunk_text(text, max_chars=3000):
     return chunks
 
 async def crawl_and_index(url, client_id, api_key, bot_name, bot_color, bot_avatar):
+    # 1. Save the CLIENT'S Key to the DB
     save_client_config(client_id, api_key, bot_name, bot_color, bot_avatar)
     
     if not url.startswith('http'): url = 'https://' + url
@@ -210,12 +218,12 @@ async def crawl_and_index(url, client_id, api_key, bot_name, bot_color, bot_avat
     if not scraped_data: return False
 
     try:
-        genai.configure(api_key=api_key)
+        # Use CLIENT'S Key for Embedding
         vectors = []
         for page in scraped_data:
             chunks = smart_chunk_text(page['text'])
             for i, chunk in enumerate(chunks):
-                embedding = get_embedding(text=chunk, task_type="retrieval_document")
+                embedding = get_embedding(text=chunk, client_api_key=api_key, task_type="retrieval_document")
                 vector_id = f"{client_id}_{abs(hash(page['url']))}_{i}"
                 vectors.append({"id": vector_id, "values": embedding, "metadata": {"text": chunk, "url": page['url']}})
 
@@ -232,17 +240,17 @@ async def crawl_and_index(url, client_id, api_key, bot_name, bot_color, bot_avat
 # --- API ENDPOINTS ---
 
 @app.get("/")
-def home(): return {"status": "FC Brain Active v6 (Restored)"}
+def home(): return {"status": "FC Brain Active (Multi-Tenant BYOK)"}
 
 @app.post("/train")
 async def train_bot(request: TrainRequest):
+    # This receives the key from the Dashboard and saves it
     success = await crawl_and_index(
         request.url, request.client_id, request.gemini_api_key, 
         request.bot_name, request.bot_color, request.bot_avatar
     )
     return {"status": "success" if success else "failed"}
 
-# --- RESTORED ENDPOINT: CONFIG ---
 @app.get("/get-config")
 async def get_config(client_id: str):
     config = get_client_config(client_id)
@@ -256,15 +264,22 @@ async def get_config(client_id: str):
 
 @app.post("/chat")
 async def chat_bot(request: ChatRequest):
+    # 1. Fetch THIS client's config from DB
     config = get_client_config(request.client_id)
-    if not config: return {"answer": "Error: Bot not configured. Run training."}
+    if not config: return {"answer": "Error: Bot not configured."}
     
-    api_key = config.get("api_key")
+    # 2. Extract THIS client's API Key
+    client_api_key = config.get("api_key")
+    if not client_api_key: return {"answer": "Error: Client API Key missing."}
+
     is_lead = check_and_save_lead(request.message, request.client_id)
 
     try:
-        genai.configure(api_key=api_key)
-        embedding = get_embedding(text=request.message, task_type="retrieval_query")
+        # 3. Configure Google to use Client's Key
+        genai.configure(api_key=client_api_key)
+        
+        # 4. Generate Embedding (using Client Key)
+        embedding = get_embedding(text=request.message, client_api_key=client_api_key, task_type="retrieval_query")
         
         search_results = index.query(namespace=request.client_id, vector=embedding, top_k=5, include_metadata=True)
         context = "\n\n".join([f"SOURCE: {m['metadata'].get('url','')}\nTEXT: {m['metadata']['text']}" for m in search_results['matches']])
@@ -321,6 +336,7 @@ async def get_analytics(request: AutoSyncRequest):
         ai_summary = "Not enough data yet."
         if len(user_questions) > 5:
             try:
+                # Use CLIENT'S KEY for Analytics too
                 genai.configure(api_key=config.get("api_key"))
                 model = genai.GenerativeModel(get_best_model())
                 res = model.generate_content(f"Analyze these user questions and list Top 3 common topics:\n{', '.join(user_questions[:30])}")

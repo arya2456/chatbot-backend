@@ -15,7 +15,7 @@ from uuid import uuid4
 
 # --- CONFIGURATION ---
 PINECONE_INDEX_NAME = "chatbot-index"
-PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")  # Removed hardcoded fallback
+PINECONE_API_KEY = os.getenv("PINECONE_API_KEY" "pcsk_2Nqmmq_MaJE7qaPCmboMMTC6gLsC8w7Ahx826mLb5a5Lx4vtfKx74zAF7iLhiZHjq3qE2W")  # Removed hardcoded fallback
 if not PINECONE_API_KEY:
     raise ValueError("PINECONE_API_KEY environment variable is required")
 

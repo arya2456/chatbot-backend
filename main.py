@@ -41,7 +41,7 @@ class TrainRequest(BaseModel):
     bot_name: str = "AI Support"
     bot_color: str = "#4F46E5"
     bot_avatar: str = ""
-    bot_personality: str = "Helpful and professional" # [NEW] Teacher Mode
+    bot_personality: str = "Helpful and professional"
 
 class ChatRequest(BaseModel):
     message: str
@@ -53,9 +53,7 @@ class AutoSyncRequest(BaseModel):
     client_id: str
 
 # --- HELPERS ---
-
 def save_client_config(client_id, api_key, bot_name, bot_color, bot_avatar, bot_personality):
-    """Saves Client Config + Personality"""
     try:
         index.upsert(
             vectors=[{
@@ -105,9 +103,7 @@ def check_and_save_lead(message, client_id):
     return False
 
 def get_chat_history(client_id, session_id):
-    """ [NEW] MEMORY: Fetches last 3 interactions """
     try:
-        # Dummy query to find recent chat logs (metadata filter)
         results = index.query(
             namespace=client_id,
             vector=[0.01] * 768,
@@ -115,9 +111,7 @@ def get_chat_history(client_id, session_id):
             include_metadata=True,
             filter={"type": "chat_log", "session_id": session_id}
         )
-        # Sort by timestamp (oldest first)
         sorted_matches = sorted(results['matches'], key=lambda x: x['metadata'].get('timestamp', 0))
-        
         history_text = ""
         for m in sorted_matches:
             user = m['metadata'].get('user_msg', '')
@@ -134,7 +128,7 @@ def log_chat(client_id, session_id, user_msg, bot_msg):
         index.upsert(
             vectors=[{
                 "id": log_id,
-                "values": [0.01] * 768, # Dummy vector for metadata storage
+                "values": [0.01] * 768,
                 "metadata": {
                     "type": "chat_log",
                     "session_id": session_id,
@@ -151,7 +145,6 @@ def log_chat(client_id, session_id, user_msg, bot_msg):
 # --- EMBEDDING HELPER ---
 def get_embedding(text: str, client_api_key: str, task_type: str = "retrieval_document"):
     genai.configure(api_key=client_api_key)
-    # Using text-embedding-004 (Modern Model)
     result = genai.embed_content(
         model="models/text-embedding-004",
         content=text,
@@ -160,15 +153,15 @@ def get_embedding(text: str, client_api_key: str, task_type: str = "retrieval_do
     return result['embedding']
 
 def get_best_model():
-    return "models/gemini-2.5-flash"
+    return "models/gemini-2.0-flash"
 
-# --- CRAWLER LOGIC ---
+# --- ROBUST CRAWLER LOGIC ---
 async def fetch_sitemap(session, base_url):
     potential_sitemaps = [urljoin(base_url, "sitemap.xml"), urljoin(base_url, "wp-sitemap.xml")]
     found_urls = set()
     for sitemap_url in potential_sitemaps:
         try:
-            async with session.get(sitemap_url, timeout=10) as resp:
+            async with session.get(sitemap_url, timeout=10, ssl=False) as resp:
                 if resp.status == 200:
                     content = await resp.text()
                     try:
@@ -181,9 +174,12 @@ async def fetch_sitemap(session, base_url):
     return []
 
 async def fetch_url(session, url):
-    headers = {"User-Agent": "Mozilla/5.0 (compatible; FC-Bot/1.0)"}
+    # Spoof a real browser to avoid being blocked
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+    }
     try:
-        async with session.get(url, headers=headers, timeout=12) as resp:
+        async with session.get(url, headers=headers, timeout=15, ssl=False) as resp:
             if resp.status == 200:
                 return await resp.text(), url
     except: pass
@@ -203,7 +199,6 @@ def smart_chunk_text(text, max_chars=3000):
     return chunks
 
 async def crawl_and_index(url, client_id, api_key, bot_name, bot_color, bot_avatar, bot_personality):
-    # Save Config with Personality
     save_client_config(client_id, api_key, bot_name, bot_color, bot_avatar, bot_personality)
     
     if not url.startswith('http'): url = 'https://' + url
@@ -225,6 +220,7 @@ async def crawl_and_index(url, client_id, api_key, bot_name, bot_color, bot_avat
                 visited.add(current_url)
                 soup = BeautifulSoup(html, 'html.parser')
                 
+                # Internal link discovery if sitemap failed
                 if not sitemap_urls:
                     base_domain = urlparse(url).netloc.replace("www.", "")
                     for link in soup.find_all('a', href=True):
@@ -244,7 +240,6 @@ async def crawl_and_index(url, client_id, api_key, bot_name, bot_color, bot_avat
         for page in scraped_data:
             chunks = smart_chunk_text(page['text'])
             for i, chunk in enumerate(chunks):
-                # Use Client Key
                 embedding = get_embedding(text=chunk, client_api_key=api_key, task_type="retrieval_document")
                 vector_id = f"{client_id}_{abs(hash(page['url']))}_{i}"
                 vectors.append({"id": vector_id, "values": embedding, "metadata": {"text": chunk, "url": page['url']}})
@@ -262,7 +257,7 @@ async def crawl_and_index(url, client_id, api_key, bot_name, bot_color, bot_avat
 # --- API ENDPOINTS ---
 
 @app.get("/")
-def home(): return {"status": "FC Super-Brain Active (Memory + Links + Active Lead Gen)"}
+def home(): return {"status": "FC Super-Brain Active"}
 
 @app.post("/train")
 async def train_bot(request: TrainRequest):
@@ -285,7 +280,6 @@ async def get_config(client_id: str):
 
 @app.post("/chat")
 async def chat_bot(request: ChatRequest):
-    # 1. Load Config
     config = get_client_config(request.client_id)
     if not config: return {"answer": "Error: Bot not configured."}
     
@@ -293,45 +287,28 @@ async def chat_bot(request: ChatRequest):
     bot_personality = config.get("bot_personality", "Helpful and polite")
     if not client_api_key: return {"answer": "Error: Client API Key missing."}
 
-    # 2. Check for Lead
     is_lead = check_and_save_lead(request.message, request.client_id)
-
-    # 3. [NEW] Fetch Memory (Context Awareness)
     history = get_chat_history(request.client_id, request.session_id)
 
     try:
         genai.configure(api_key=client_api_key)
-        
-        # 4. Generate Embedding & Search
         embedding = get_embedding(text=request.message, client_api_key=client_api_key, task_type="retrieval_query")
         search_results = index.query(namespace=request.client_id, vector=embedding, top_k=5, include_metadata=True)
         
         context = "\n\n".join([f"SOURCE: {m['metadata'].get('url','')}\nTEXT: {m['metadata']['text']}" for m in search_results['matches']])
         
-        # 5. [NEW] Super System Prompt
         system = f"""
         You are a smart AI assistant for {request.client_id}.
-        
         YOUR PERSONALITY: {bot_personality}
-        
-        KNOWLEDGE BASE:
-        {context}
-        
-        RECENT CHAT HISTORY:
-        {history}
-        
+        KNOWLEDGE BASE: {context}
+        RECENT CHAT HISTORY: {history}
         INSTRUCTIONS:
         1. Answer strictly based on the KNOWLEDGE BASE. 
         2. [IMPORTANT] If you give a contact, blog, or page reference, YOU MUST format it as a clickable Markdown link: [Link Text](URL).
         3. [IMPORTANT] If the user's question is NOT answered by the Knowledge Base, reply exactly: "I don't have that information. Would you like to contact our team?"
-        4. Be concise and natural.
         """
-        
-        # 6. [NEW] Active Lead Generation (Ask for email if not given yet)
-        # We append this instruction if the chat history is getting long (>2 turns) and we haven't captured a lead yet.
         if len(history) > 200 and not is_lead: 
-            system += "\n[HIDDEN GOAL] If you answer the question successfully, politely ask: 'By the way, I can send more details to your inbox. What is your email address?'"
-        
+            system += "\n[HIDDEN GOAL] If you answer successfully, politely ask: 'I can send details to your inbox. What is your email?'"
         if is_lead: system += "\n(User provided email. Confirm receipt nicely.)"
 
         model = genai.GenerativeModel(get_best_model())

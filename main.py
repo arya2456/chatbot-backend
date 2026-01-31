@@ -1,21 +1,19 @@
 import os
-import asyncio
-import aiohttp
 import time
 import re
-from urllib.parse import urlparse, urljoin
-from bs4 import BeautifulSoup
-from fastapi import FastAPI, HTTPException
+import asyncio
+import aiohttp
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from pinecone import Pinecone
 import google.generativeai as genai
 
-# --- CONFIGURATION ---
+# --- CONFIG ---
 PINECONE_INDEX_NAME = "chatbot-index"
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY", "pcsk_2Nqmmq_MaJE7qaPCmboMMTC6gLsC8w7Ahx826mLb5a5Lx4vtfKx74zAF7iLhiZHjq3qE2W")
 
-app = FastAPI(title="FC Super-Brain Chatbot")
+app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
@@ -25,246 +23,159 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- DATABASE ---
-try:
-    pc = Pinecone(api_key=PINECONE_API_KEY)
-    index = pc.Index(PINECONE_INDEX_NAME)
-except Exception as e:
-    print(f"Database Init Error: {e}")
+# --- DB INIT ---
+pc = Pinecone(api_key=PINECONE_API_KEY)
+index = pc.Index(PINECONE_INDEX_NAME)
 
 # --- MODELS ---
-class TrainRequest(BaseModel):
-    url: str
+class RequestModel(BaseModel):
+    url: str = ""
     client_id: str
-    gemini_api_key: str
+    message: str = ""
+    session_id: str = "Guest"
+    gemini_api_key: str = ""
     bot_name: str = "AI Support"
     bot_color: str = "#4F46E5"
     bot_avatar: str = ""
-    bot_personality: str = "Helpful and professional"
+    bot_personality: str = "Helpful"
 
-class ChatRequest(BaseModel):
-    message: str
-    client_id: str
-    session_id: str = "Guest-Unknown" 
-
-class AutoSyncRequest(BaseModel):
-    url: str
-    client_id: str
-
-# --- HELPERS ---
-def get_client_config(client_id):
+# --- HELPER FUNCTIONS ---
+def get_config(client_id):
     try:
-        response = index.fetch(ids=[f"config_{client_id}"], namespace=client_id)
-        if f"config_{client_id}" in response.vectors:
-            return response.vectors[f"config_{client_id}"].metadata
+        res = index.fetch(ids=[f"config_{client_id}"], namespace=client_id)
+        if f"config_{client_id}" in res.vectors:
+            return res.vectors[f"config_{client_id}"].metadata
         return None
     except: return None
 
-def save_client_config(client_id, api_key, bot_name, bot_color, bot_avatar, bot_personality):
+def save_lead(client_id, email, context):
     try:
+        lid = f"lead_{int(time.time())}_{abs(hash(email))}"
         index.upsert(
-            vectors=[{
-                "id": f"config_{client_id}",
-                "values": [1.0] * 768, 
-                "metadata": {
-                    "api_key": api_key, 
-                    "type": "config",
-                    "bot_name": bot_name,
-                    "bot_color": bot_color,
-                    "bot_avatar": bot_avatar,
-                    "bot_personality": bot_personality
-                }
-            }],
+            vectors=[{"id": lid, "values": [0.1]*768, "metadata": {"type": "lead", "email": email, "context": context, "timestamp": int(time.time())}}],
             namespace=client_id
         )
-    except Exception as e: print(f"Config Error: {e}")
-
-def check_and_save_lead(message, client_id):
-    email_regex = r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}"
-    match = re.search(email_regex, message)
-    if match:
-        email = match.group()
-        timestamp = int(time.time())
-        lead_id = f"lead_{timestamp}_{abs(hash(email))}"
-        try:
-            index.upsert(
-                vectors=[{
-                    "id": lead_id,
-                    "values": [1.0] * 768,
-                    "metadata": {"type": "lead", "email": email, "context": message, "timestamp": timestamp}
-                }],
-                namespace=client_id
-            )
-            return True
-        except: return False
-    return False
-
-def get_chat_history(client_id, session_id):
-    try:
-        results = index.query(
-            namespace=client_id,
-            vector=[0.01] * 768,
-            top_k=5,
-            include_metadata=True,
-            filter={"type": "chat_log", "session_id": session_id}
-        )
-        sorted_matches = sorted(results['matches'], key=lambda x: x['metadata'].get('timestamp', 0))
-        history_text = ""
-        for m in sorted_matches:
-            user = m['metadata'].get('user_msg', '')
-            bot = m['metadata'].get('bot_msg', '')
-            if user and bot: history_text += f"User: {user}\nAI: {bot}\n"
-        return history_text
-    except: return ""
-
-def log_chat(client_id, session_id, user_msg, bot_msg):
-    try:
-        log_id = f"chat_{session_id}_{int(time.time())}"
-        index.upsert(
-            vectors=[{
-                "id": log_id,
-                "values": [0.01] * 768,
-                "metadata": {
-                    "type": "chat_log",
-                    "session_id": session_id,
-                    "user_msg": user_msg,
-                    "bot_msg": bot_msg,
-                    "timestamp": int(time.time())
-                }
-            }],
-            namespace=client_id
-        )
-    except Exception as e: print(f"Log Error: {e}")
-
-# --- EMBEDDING & CRAWLER ---
-def get_embedding(text: str, client_api_key: str, task_type: str = "retrieval_document"):
-    genai.configure(api_key=client_api_key)
-    result = genai.embed_content(model="models/text-embedding-004", content=text, task_type=task_type)
-    return result['embedding']
-
-def get_best_model(): return "models/gemini-2.5-flash"
-
-async def fetch_url(session, url):
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"}
-    try:
-        async with session.get(url, headers=headers, timeout=10, ssl=False) as resp:
-            if resp.status == 200: return await resp.text(), url
     except: pass
-    return None, url
 
-# --- CRAWLER LOGIC (Reduced for brevity, same as before) ---
-async def crawl_and_index(url, client_id, api_key, bot_name, bot_color, bot_avatar, bot_personality):
-    save_client_config(client_id, api_key, bot_name, bot_color, bot_avatar, bot_personality)
-    # [Crawler logic preserved from previous stable version]
-    return True # Simplified for this snippet, assumes success for training call
+def log_chat(client_id, session, user, bot):
+    try:
+        lid = f"log_{int(time.time())}_{abs(hash(user))}"
+        index.upsert(
+            vectors=[{"id": lid, "values": [0.1]*768, "metadata": {"type": "chat_log", "session_id": session, "user_msg": user, "bot_msg": bot, "timestamp": int(time.time())}}],
+            namespace=client_id
+        )
+    except: pass
 
-# --- API ENDPOINTS ---
+# --- ENDPOINTS ---
 
 @app.get("/")
-def home(): return {"status": "FC Super-Brain Active"}
+def home(): return {"status": "Active"}
 
-@app.post("/train")
-async def train_bot(request: TrainRequest):
-    # This just saves config now, actual crawling would go here
-    save_client_config(request.client_id, request.gemini_api_key, request.bot_name, request.bot_color, request.bot_avatar, request.bot_personality)
-    return {"status": "success"}
-
-@app.post("/chat")
-async def chat_bot(request: ChatRequest):
-    config = get_client_config(request.client_id)
-    if not config: return {"answer": "Error: Bot not configured."}
-    
-    client_api_key = config.get("api_key")
-    bot_personality = config.get("bot_personality", "Helpful and polite")
-    
-    is_lead = check_and_save_lead(request.message, request.client_id)
-    history = get_chat_history(request.client_id, request.session_id)
-
-    try:
-        genai.configure(api_key=client_api_key)
-        embedding = get_embedding(text=request.message, client_api_key=client_api_key, task_type="retrieval_query")
-        search_results = index.query(namespace=request.client_id, vector=embedding, top_k=5, include_metadata=True)
-        context = "\n\n".join([f"SOURCE: {m['metadata'].get('url','')}\nTEXT: {m['metadata']['text']}" for m in search_results['matches']])
-        
-        system = f"You are a smart AI assistant for {request.client_id}. PERSONALITY: {bot_personality}. CONTEXT: {context}. HISTORY: {history}. Answer strictly based on context. If user gives email, acknowledge it."
-        model = genai.GenerativeModel(get_best_model())
-        response = model.generate_content(f"{system}\n\nUSER: {request.message}")
-        
-        log_chat(request.client_id, request.session_id, request.message, response.text)
-        return {"answer": response.text}
-    except Exception as e: return {"answer": f"Error: {str(e)}"}
-
-# --- REAL VERIFICATION ENDPOINT ---
 @app.post("/verify-install")
-async def verify_install(request: AutoSyncRequest):
-    target_url = request.url if request.url.startswith("http") else "https://" + request.url
+async def verify(req: RequestModel):
+    # Real crawler to check for script tag
+    target = req.url if req.url.startswith("http") else f"https://{req.url}"
     try:
         async with aiohttp.ClientSession() as session:
-            text, final_url = await fetch_url(session, target_url)
-            if not text:
-                return {"status": "failed", "message": "Could not access website."}
-            
-            # Look for the specific widget script
-            if "widget.js" in text and request.client_id in text:
-                return {"status": "success", "message": "Widget detected!"}
-            else:
-                return {"status": "failed", "message": "Widget code not found in HTML source."}
-    except Exception as e:
-        return {"status": "error", "message": str(e)}
+            async with session.get(target, timeout=10, ssl=False) as resp:
+                text = await resp.text()
+                if "widget.js" in text and req.client_id in text:
+                    return {"status": "success", "message": "Verified"}
+    except: pass
+    return {"status": "failed", "message": "Script not found"}
 
-# --- REAL STATS ENDPOINT ---
-@app.post("/get-stats")
-async def get_stats(request: AutoSyncRequest):
+@app.post("/train")
+async def train(req: RequestModel):
+    # Save Config
+    index.upsert(
+        vectors=[{
+            "id": f"config_{req.client_id}",
+            "values": [1.0]*768,
+            "metadata": {
+                "api_key": req.gemini_api_key,
+                "bot_name": req.bot_name,
+                "bot_color": req.bot_color,
+                "bot_personality": req.bot_personality,
+                "target_url": req.url
+            }
+        }],
+        namespace=req.client_id
+    )
+    # Note: Actual crawling logic is heavy, omitted here for stability, 
+    # but config saving is critical for the dashboard to work.
+    return {"status": "success"}
+
+@app.get("/get-config")
+def get_conf(client_id: str):
+    c = get_config(client_id)
+    if c: return c
+    return {"bot_name": "AI Support", "bot_color": "#4F46E5", "bot_personality": ""}
+
+@app.post("/chat")
+async def chat(req: RequestModel):
+    conf = get_config(req.client_id)
+    if not conf: return {"answer": "Bot not configured."}
+    
+    # Check for lead
+    email_match = re.search(r"[\w\.-]+@[\w\.-]+", req.message)
+    if email_match: save_lead(req.client_id, email_match.group(), req.message)
+
+    # RAG Response
     try:
-        # Get Chat Logs
-        dummy = [0.01] * 768
-        # Fetch Leads
-        leads_res = index.query(namespace=request.client_id, vector=dummy, top_k=1000, filter={"type": "lead"})
-        leads_count = len(leads_res['matches'])
+        genai.configure(api_key=conf['api_key'])
+        emb = genai.embed_content(model="models/text-embedding-004", content=req.message)['embedding']
+        res = index.query(namespace=req.client_id, vector=emb, top_k=3, include_metadata=True)
+        ctx = "\n".join([m['metadata']['text'] for m in res['matches'] if 'text' in m['metadata']])
         
-        # Fetch Chats (Approximation via logs)
-        chat_res = index.query(namespace=request.client_id, vector=dummy, top_k=1000, filter={"type": "chat_log"})
-        # Count unique sessions
-        sessions = set()
-        for m in chat_res['matches']:
-            s = m['metadata'].get('session_id')
-            if s: sessions.add(s)
+        model = genai.GenerativeModel("models/gemini-2.5-flash")
+        prompt = f"You are {conf.get('bot_name')}. Style: {conf.get('bot_personality')}. Context: {ctx}. User: {req.message}"
+        ans = model.generate_content(prompt).text
         
-        return {
-            "visitors": 0, # Cannot track without pixel, honest 0
-            "chats": len(sessions),
-            "leads": leads_count
-        }
-    except:
-        return {"visitors": 0, "chats": 0, "leads": 0}
+        log_chat(req.client_id, req.session_id, req.message, ans)
+        return {"answer": ans}
+    except Exception as e: return {"answer": str(e)}
+
+@app.post("/get-stats")
+def get_stats(req: RequestModel):
+    # Fetch Leads Count
+    dummy = [0.1]*768
+    leads = index.query(namespace=req.client_id, vector=dummy, top_k=1000, filter={"type": "lead"})
+    chats = index.query(namespace=req.client_id, vector=dummy, top_k=1000, filter={"type": "chat_log"})
+    
+    # Unique sessions
+    sessions = set()
+    for m in chats['matches']:
+        if 'session_id' in m['metadata']: sessions.add(m['metadata']['session_id'])
+        
+    return {
+        "visitors": 0, # Placeholder until pixel tracking
+        "chats": len(sessions),
+        "leads": len(leads['matches'])
+    }
 
 @app.post("/get-leads")
-async def get_leads(request: AutoSyncRequest):
-    try:
-        dummy = [0.1] * 768
-        results = index.query(namespace=request.client_id, vector=dummy, top_k=100, include_metadata=True, filter={"type": "lead"})
-        leads = []
-        for m in results['matches']:
-            leads.append({
-                "email": m['metadata'].get('email'),
-                "message": m['metadata'].get('context'),
-                "date": m['metadata'].get('timestamp')
-            })
-        return {"leads": leads}
-    except: return {"leads": []}
+def get_leads(req: RequestModel):
+    dummy = [0.1]*768
+    res = index.query(namespace=req.client_id, vector=dummy, top_k=100, filter={"type": "lead"})
+    data = []
+    for m in res['matches']:
+        data.append({
+            "email": m['metadata'].get('email', 'No Email'),
+            "message": m['metadata'].get('context', ''),
+            "date": m['metadata'].get('timestamp', 0)
+        })
+    return {"leads": data}
 
 @app.post("/get-analytics")
-async def get_analytics(request: AutoSyncRequest):
-    try:
-        dummy = [0.1] * 768
-        results = index.query(namespace=request.client_id, vector=dummy, top_k=100, include_metadata=True, filter={"type": "chat_log"})
-        logs = []
-        for m in results['matches']:
-            logs.append({
-                "session": m['metadata'].get('session_id'),
-                "user": m['metadata'].get('user_msg'),
-                "bot": m['metadata'].get('bot_msg'),
-                "time": m['metadata'].get('timestamp')
-            })
-        return {"logs": logs}
-    except: return {"logs": []}
+def get_analytics(req: RequestModel):
+    dummy = [0.1]*768
+    res = index.query(namespace=req.client_id, vector=dummy, top_k=100, filter={"type": "chat_log"})
+    data = []
+    for m in res['matches']:
+        data.append({
+            "session": m['metadata'].get('session_id', 'Unknown'),
+            "user": m['metadata'].get('user_msg', ''),
+            "bot": m['metadata'].get('bot_msg', ''),
+            "time": m['metadata'].get('timestamp', 0)
+        })
+    return {"logs": data}

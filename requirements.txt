@@ -1,9 +1,10 @@
 fastapi
 uvicorn
 pydantic
-requests
-beautifulsoup4
-pinecone>=3.0.0
-google-generativeai>=0.8.0
-python-multipart
+pinecone-client
+google-generativeai
 aiohttp
+beautifulsoup4
+apscheduler
+python-multipart
+requests

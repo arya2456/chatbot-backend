@@ -85,13 +85,13 @@ async def extract_theme_color(session, url):
             return meta_theme.get("content") if meta_theme else "#4F46E5"
     except: return "#4F46E5"
 
-# --- RECURSIVE DEEP CRAWLER ---
+# --- RECURSIVE DEEP CRAWLER (WITH AUTO-THEME) ---
 async def deep_crawl(start_url: str, client_id: str, api_key: str, max_pages: int = 40):
     if not start_url.startswith("http"): start_url = f"https://{start_url}"
     genai.configure(api_key=api_key)
     
     async with aiohttp.ClientSession() as session:
-        # --- NEW: AUTO THEME DETECTION ---
+        # --- AUTO THEME DETECTION ---
         detected_color = await extract_theme_color(session, start_url)
         res_conf = index.fetch(ids=[f"config_{client_id}"], namespace=client_id)
         if res_conf.vectors:
@@ -124,13 +124,13 @@ async def deep_crawl(start_url: str, client_id: str, api_key: str, max_pages: in
                     for i, chunk in enumerate(chunks):
                         emb = genai.embed_content(model="models/text-embedding-004", content=chunk)['embedding']
                         vectors.append({"id": f"web_{client_id}_{len(visited)}_{i}", "values": emb, "metadata": {"text": chunk, "url": url, "type": "knowledge", "source": "website"}})
-                    if len(vectors) > 30:
+                    if len(vectors) > 40:
                         index.upsert(vectors=vectors, namespace=client_id)
                         vectors = []
             except: continue
     if vectors: index.upsert(vectors=vectors, namespace=client_id)
 
-# --- ADVANCED DOCUMENT INTELLIGENCE ---
+# --- ADVANCED DOCUMENT INTELLIGENCE (PDF VECTORS) ---
 @app.post("/upload-file")
 async def upload_file_engine(client_id: str, file: UploadFile = File(...)):
     try:
@@ -157,10 +157,10 @@ async def upload_file_engine(client_id: str, file: UploadFile = File(...)):
                 "metadata": {"text": chunk, "source": file.filename, "type": "knowledge", "category": "uploaded_document"}
             })
         index.upsert(vectors=vectors, namespace=client_id)
-        return {"status": "success", "message": f"Successfully learned from {file.filename}"}
+        return {"status": "success", "message": f"Learned from {file.filename}"}
     except Exception as e: return {"status": "error", "message": str(e)}
 
-# --- PRODUCTION CHAT ENGINE ---
+# --- PRODUCTION CHAT ENGINE (FORCE 2.5 FLASH & ERROR RETRY) ---
 @app.post("/chat")
 async def brain_chat_master(req: ChatRequest):
     try:
@@ -178,8 +178,9 @@ async def brain_chat_master(req: ChatRequest):
         search = index.query(namespace=req.client_id, vector=emb, top_k=7, include_metadata=True, filter={"type": "knowledge"})
         context = "\n\n".join([m['metadata']['text'] for m in search['matches']])
         
-        call_cta = f"\n\nSchedule a call here: {conf.get('call_link')}" if conf.get("call_link") else ""
-        sys_msg = f"Role: {conf.get('bot_name')} at {conf.get('biz_name')}. Persona: {conf.get('bot_personality')}. Knowledge: {context}. {call_cta}. Fallback: {conf.get('fallback')}"
+        call_link = conf.get('call_link')
+        cta = f"\n\nYou can also book a call here: {call_link}" if call_link else ""
+        sys_msg = f"Role: {conf.get('bot_name')} at {conf.get('biz_name')}. Persona: {conf.get('bot_personality')}. Knowledge: {context}. {cta}. Fallback: {conf.get('fallback')}"
         
         model = genai.GenerativeModel("gemini-2.5-flash") 
         ans = model.generate_content(f"{sys_msg}\n\nUSER: {req.message}").text
@@ -191,7 +192,7 @@ async def brain_chat_master(req: ChatRequest):
         logger.error(f"Chat error: {e}")
         return {"answer": "I'm optimizing my neural links. Could you ask that one more time?"}
 
-# --- REMAINING ENDPOINTS (get-config, train, get-stats, etc.) ---
+# --- THEME & CONFIG DELIVERY ---
 @app.post("/get-config")
 async def get_site_specific_config(req: AutoSyncRequest):
     try:
@@ -208,6 +209,7 @@ async def get_site_specific_config(req: AutoSyncRequest):
         return {"bot_name": "Support", "bot_color": "#4F46E5"}
     except: return {"bot_name": "Support", "bot_color": "#4F46E5"}
 
+# --- TRAINING, STATS, & VERIFICATION ---
 @app.post("/train")
 async def train_engine(req: TrainRequest, bg: BackgroundTasks):
     meta = {
@@ -252,8 +254,8 @@ async def verify_engine(req: AutoSyncRequest):
             async with session.get(target, timeout=12, headers=headers, ssl=False) as resp:
                 html = await resp.text()
                 if "widget.js" in html and req.client_id in html: return {"status": "success", "message": "Verified"}
-                return {"status": "failed", "message": "Code not detected"}
+                return {"status": "failed", "message": "Code Missing"}
     except: return {"status": "failed", "message": "Unreachable"}
 
 @app.get("/")
-def health(): return {"status": "Omni-Brain v9.5 Final Active"}
+def health(): return {"status": "Omni-Brain v9.5 Production Active"}

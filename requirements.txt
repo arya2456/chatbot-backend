@@ -8,3 +8,5 @@ beautifulsoup4
 apscheduler
 python-multipart
 requests
+pypdf
+python-multipart

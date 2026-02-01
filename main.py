@@ -128,7 +128,7 @@ async def deep_scraper_engine(start_url: str, client_id: str, api_key: str, max_
                     if len(raw_text) < 200: continue
 
                     # AI fact cleaning (Gemini 2.5)
-                    cleaner_model = genai.GenerativeModel("gemini-2.0-flash")
+                    cleaner_model = genai.GenerativeModel("gemini-2.5-flash")
                     clean_facts = cleaner_model.generate_content(
                         f"EXTRACT BUSINESS FACTS ONLY. Remove fluff. List links and services. TEXT: {raw_text[:8000]}"
                     ).text

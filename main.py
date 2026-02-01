@@ -260,7 +260,7 @@ async def chat(req: ChatRequest):
         - Format links as markdown [Link Text](URL).
         """
         
-        model = genai.GenerativeModel("models/gemini-2.0-flash")
+        model = genai.GenerativeModel("models/gemini-2.5-flash")
         ans = model.generate_content(sys_prompt).text
         
         lid = f"log_{int(time.time())}_{abs(hash(req.message))}"

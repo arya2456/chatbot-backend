@@ -85,7 +85,7 @@ async def extract_theme_color(session, url):
 # --- STEP 1: DEEP INTELLIGENCE RECURSIVE SCRAPER ---
 async def deep_scraper_engine(start_url: str, client_id: str, api_key: str, max_pages: int = 50):
     """
-    Advanced Recursive Super-Brain:
+    Recursive Super-Brain:
     1. Maps all internal links (Pricing, FAQ, Services, etc.)
     2. Uses Gemini to clean raw HTML into pure business facts.
     3. Stores concepts as AI Vectors for perfect recall.
@@ -179,7 +179,7 @@ async def upload_file_engine(client_id: str, file: UploadFile = File(...)):
         return {"status": "success", "message": f"Learned from {file.filename}"}
     except Exception as e: return {"status": "error", "message": str(e)}
 
-# --- PRODUCTION CHAT ENGINE (IDENTITY & CONCISION GUARD) ---
+# --- PRODUCTION CHAT ENGINE (IDENTITY & BREVITY GUARD) ---
 @app.post("/chat")
 async def brain_chat_master(req: ChatRequest):
     try:
@@ -241,7 +241,7 @@ async def train_engine_v10(req: TrainRequest, bg: BackgroundTasks):
     bg.add_task(deep_scraper_engine, req.url, req.client_id, req.gemini_api_key)
     return {"status": "success", "message": "Deep Neural Mapping Started."}
 
-# --- CONFIG, STATS, & VERIFICATION (EXISTING) ---
+# --- CONFIG, STATS, & VERIFICATION ---
 @app.post("/get-config")
 async def get_site_specific_config(req: AutoSyncRequest):
     try:

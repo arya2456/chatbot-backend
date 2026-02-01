@@ -21,7 +21,7 @@ PINECONE_API_KEY = os.getenv("PINECONE_API_KEY", "pcsk_2Nqmmq_MaJE7qaPCmboMMTC6g
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Omni-Brain v9.5 Final", version="9.5")
+app = FastAPI(title="Omni-Brain v10.0 Final", version="10.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 # --- DATABASE INIT ---
@@ -50,9 +50,6 @@ class TrainRequest(BaseModel):
     collect_phone: bool = True
     collect_company: bool = False
     trigger_strategy: str = "Before sharing pricing"
-    email_alerts: bool = True
-    alert_recipient: str = ""
-    crm_integration: str = "None (Store Locally)"
     book_call_active: bool = False
     book_call_link: str = ""
     whatsapp_active: bool = False
@@ -85,11 +82,21 @@ async def extract_theme_color(session, url):
             return meta_theme.get("content") if meta_theme else "#4F46E5"
     except: return "#4F46E5"
 
-# --- RECURSIVE DEEP CRAWLER (WITH AUTO-THEME) ---
-async def deep_crawl(start_url: str, client_id: str, api_key: str, max_pages: int = 40):
+# --- STEP 1: DEEP INTELLIGENCE RECURSIVE SCRAPER ---
+async def deep_scraper_engine(start_url: str, client_id: str, api_key: str, max_pages: int = 50):
+    """
+    Advanced Recursive Super-Brain:
+    1. Maps all internal links (Pricing, FAQ, Services, etc.)
+    2. Uses Gemini to clean raw HTML into pure business facts.
+    3. Stores concepts as AI Vectors for perfect recall.
+    """
     if not start_url.startswith("http"): start_url = f"https://{start_url}"
     genai.configure(api_key=api_key)
-    
+    domain = urlparse(start_url).netloc
+    visited, vectors = set(), []
+    queue = asyncio.Queue()
+    await queue.put((start_url, 0))
+
     async with aiohttp.ClientSession() as session:
         # --- AUTO THEME DETECTION ---
         detected_color = await extract_theme_color(session, start_url)
@@ -100,42 +107,54 @@ async def deep_crawl(start_url: str, client_id: str, api_key: str, max_pages: in
                 meta["bot_color"] = detected_color
                 index.upsert(vectors=[{"id": f"config_{client_id}", "values": [1.0]*768, "metadata": meta}], namespace=client_id)
 
-        domain = urlparse(start_url).netloc
-        visited, vectors = set(), []
-        queue = asyncio.Queue()
-        await queue.put((start_url, 0))
-
         while not queue.empty() and len(visited) < max_pages:
             url, depth = await queue.get()
             if url in visited or depth > 3: continue
             visited.add(url)
             try:
-                async with session.get(url, timeout=12, ssl=False) as resp:
+                async with session.get(url, timeout=15, ssl=False) as resp:
                     if resp.status != 200: continue
                     soup = BeautifulSoup(await resp.text(), 'html.parser')
+                    
+                    # Discover new links
                     for a in soup.find_all('a', href=True):
                         link = urljoin(url, a['href']).split('#')[0].rstrip('/')
                         if urlparse(link).netloc == domain and link not in visited:
                             await queue.put((link, depth + 1))
-                    for x in soup(['script', 'style', 'nav', 'footer', 'aside']): x.decompose()
-                    text = soup.get_text(separator=' ', strip=True)
-                    if len(text) < 100: continue
-                    chunks = [text[i:i+1200] for i in range(0, len(text), 1200)]
+
+                    # Extract Content
+                    for noise in soup(['script', 'style', 'nav', 'footer', 'aside', 'iframe']): noise.decompose()
+                    raw_text = soup.get_text(separator=' ', strip=True)
+                    if len(raw_text) < 200: continue
+
+                    # AI fact cleaning (Gemini 2.5)
+                    cleaner_model = genai.GenerativeModel("gemini-2.0-flash")
+                    clean_facts = cleaner_model.generate_content(
+                        f"EXTRACT BUSINESS FACTS ONLY. Remove fluff. List links and services. TEXT: {raw_text[:8000]}"
+                    ).text
+
+                    # Create Vectors
+                    chunks = [clean_facts[i:i+1500] for i in range(0, len(clean_facts), 1500)]
                     for i, chunk in enumerate(chunks):
                         emb = genai.embed_content(model="models/text-embedding-004", content=chunk)['embedding']
-                        vectors.append({"id": f"web_{client_id}_{len(visited)}_{i}", "values": emb, "metadata": {"text": chunk, "url": url, "type": "knowledge", "source": "website"}})
+                        vectors.append({
+                            "id": f"neural_{int(time.time())}_{len(visited)}_{i}",
+                            "values": emb,
+                            "metadata": {"text": chunk, "url": url, "type": "knowledge", "source": "recursive_crawl"}
+                        })
+                    
                     if len(vectors) > 40:
                         index.upsert(vectors=vectors, namespace=client_id)
                         vectors = []
             except: continue
     if vectors: index.upsert(vectors=vectors, namespace=client_id)
+    return True
 
-# --- ADVANCED DOCUMENT INTELLIGENCE (PDF VECTORS) ---
+# --- ADVANCED DOCUMENT INTELLIGENCE ---
 @app.post("/upload-file")
 async def upload_file_engine(client_id: str, file: UploadFile = File(...)):
     try:
         res = index.fetch(ids=[f"config_{client_id}"], namespace=client_id)
-        if not res.vectors: return {"status": "error", "message": "Train website first."}
         api_key = res.vectors[f"config_{client_id}"].metadata['api_key']
         genai.configure(api_key=api_key)
         
@@ -160,30 +179,43 @@ async def upload_file_engine(client_id: str, file: UploadFile = File(...)):
         return {"status": "success", "message": f"Learned from {file.filename}"}
     except Exception as e: return {"status": "error", "message": str(e)}
 
-# --- PRODUCTION CHAT ENGINE (FORCE 2.5 FLASH & ERROR RETRY) ---
+# --- PRODUCTION CHAT ENGINE (IDENTITY & CONCISION GUARD) ---
 @app.post("/chat")
 async def brain_chat_master(req: ChatRequest):
     try:
         res = index.fetch(ids=[f"config_{req.client_id}"], namespace=req.client_id)
-        if not res.vectors: return {"answer": "Initializing neural links... please refresh."}
+        if not res.vectors: return {"answer": "Syncing neural links... please refresh."}
         conf = res.vectors[f"config_{req.client_id}"].metadata
         
         await asyncio.sleep(int(conf.get("delay", 1000)) / 1000)
 
+        # Smart Gating for Pricing
         if conf.get("leads_trigger") == "Before sharing pricing" and any(x in req.message.lower() for x in ["price", "cost", "how much", "fees"]):
-            return {"answer": "I'd be happy to share our pricing! To give you the most accurate details, could you please provide your email address first?"}
+            return {"answer": "I'd be happy to share our pricing details! Before I share our custom packages, could you please provide your email address first?"}
 
         genai.configure(api_key=conf['api_key'])
         emb = genai.embed_content(model="models/text-embedding-004", content=req.message)['embedding']
         search = index.query(namespace=req.client_id, vector=emb, top_k=7, include_metadata=True, filter={"type": "knowledge"})
-        context = "\n\n".join([m['metadata']['text'] for m in search['matches']])
+        ctx = "\n\n".join([m['metadata']['text'] for m in search['matches']])
         
-        call_link = conf.get('call_link')
-        cta = f"\n\nYou can also book a call here: {call_link}" if call_link else ""
-        sys_msg = f"Role: {conf.get('bot_name')} at {conf.get('biz_name')}. Persona: {conf.get('bot_personality')}. Knowledge: {context}. {cta}. Fallback: {conf.get('fallback')}"
+        call_cta = f"\n\nSchedule a call here: {conf.get('call_link')}" if conf.get("call_link") else ""
         
-        model = genai.GenerativeModel("gemini-2.5-flash") 
-        ans = model.generate_content(f"{sys_msg}\n\nUSER: {req.message}").text
+        # --- THE FIX: STRICT IDENTITY & BREVITY PROMPT ---
+        sys_msg = f"""
+        STRICT IDENTITY: You are {conf.get('bot_name')} at "{conf.get('biz_name')}". 
+        NEVER mention 'Acme' or other companies. Use ONLY dashboard info.
+        
+        STRICT LIMITS:
+        - 1 to 3 lines maximum per answer. 
+        - Provide links/tools IMMEDIATELY if asked. Format: [Name](URL).
+        - No long lectures. No bullet points unless requested.
+        
+        KNOWLEDGE: {ctx}
+        FALLBACK: If info is missing, say: "{conf.get('fallback')}"
+        """
+        
+        model = genai.GenerativeModel("gemini-2.0-flash") 
+        ans = model.generate_content(f"{sys_msg}\n\nUSER QUERY: {req.message}").text
         
         m_type = "lead" if re.search(r"[\w\.-]+@[\w\.-]+", req.message) else "chat_log"
         index.upsert(vectors=[{"id": f"log_{int(time.time())}", "values": [0.1]*768, "metadata": {"type": m_type, "user": req.message, "bot": ans, "session": req.session_id, "timestamp": int(time.time()), "email": req.message if m_type=="lead" else "", "context": req.message}}], namespace=req.client_id)
@@ -192,7 +224,24 @@ async def brain_chat_master(req: ChatRequest):
         logger.error(f"Chat error: {e}")
         return {"answer": "I'm optimizing my neural links. Could you ask that one more time?"}
 
-# --- THEME & CONFIG DELIVERY ---
+# --- STEP 2: FORCE INTELLIGENCE DASHBOARD LOGIC ---
+@app.post("/train")
+async def train_engine_v10(req: TrainRequest, bg: BackgroundTasks):
+    meta = {
+        "type": "config", "api_key": req.gemini_api_key, "bot_name": req.bot_name,
+        "bot_lang": req.bot_lang, "bot_status": str(req.bot_status),
+        "biz_name": req.biz_name, "biz_phone": req.biz_phone, "biz_email": req.biz_email,
+        "leads_trigger": req.trigger_strategy,
+        "call_link": req.book_call_link if req.book_call_active else "",
+        "wa_num": req.whatsapp_number if req.whatsapp_active else "",
+        "delay": str(req.response_delay_ms), "fallback": req.fallback_msg,
+        "bot_personality": req.bot_personality, "bot_color": req.bot_color, "url": req.url
+    }
+    index.upsert(vectors=[{"id": f"config_{req.client_id}", "values": [1.0]*768, "metadata": meta}], namespace=req.client_id)
+    bg.add_task(deep_scraper_engine, req.url, req.client_id, req.gemini_api_key)
+    return {"status": "success", "message": "Deep Neural Mapping Started."}
+
+# --- CONFIG, STATS, & VERIFICATION (EXISTING) ---
 @app.post("/get-config")
 async def get_site_specific_config(req: AutoSyncRequest):
     try:
@@ -202,30 +251,10 @@ async def get_site_specific_config(req: AutoSyncRequest):
             return {
                 "bot_name": data.get("bot_name", "Support"),
                 "bot_color": data.get("bot_color", "#4F46E5"),
-                "bot_status": data.get("bot_status", "True"),
-                "biz_name": data.get("biz_name", ""),
                 "welcome_msg": "Hi! I'm " + data.get("bot_name", "Support") + ". How can I help?"
             }
         return {"bot_name": "Support", "bot_color": "#4F46E5"}
     except: return {"bot_name": "Support", "bot_color": "#4F46E5"}
-
-# --- TRAINING, STATS, & VERIFICATION ---
-@app.post("/train")
-async def train_engine(req: TrainRequest, bg: BackgroundTasks):
-    meta = {
-        "type": "config", "api_key": req.gemini_api_key, "bot_name": req.bot_name,
-        "bot_lang": req.bot_lang, "bot_status": str(req.bot_status),
-        "biz_name": req.biz_name, "biz_phone": req.biz_phone, "biz_email": req.biz_email,
-        "leads_trigger": req.trigger_strategy,
-        "call_link": req.book_call_link if req.book_call_active else "",
-        "wa_num": req.whatsapp_number if req.whatsapp_active else "",
-        "delay": str(req.response_delay_ms), "fallback": req.fallback_msg,
-        "max_len": str(req.max_conv_length), "url": req.url,
-        "bot_personality": req.bot_personality, "bot_color": req.bot_color
-    }
-    index.upsert(vectors=[{"id": f"config_{req.client_id}", "values": [1.0]*768, "metadata": meta}], namespace=req.client_id)
-    bg.add_task(deep_crawl, req.url, req.client_id, req.gemini_api_key)
-    return {"status": "success"}
 
 @app.post("/get-stats")
 def stats_engine(req: AutoSyncRequest):
@@ -258,4 +287,4 @@ async def verify_engine(req: AutoSyncRequest):
     except: return {"status": "failed", "message": "Unreachable"}
 
 @app.get("/")
-def health(): return {"status": "Omni-Brain v9.5 Production Active"}
+def health(): return {"status": "Omni-Brain v10.0 Production Active"}

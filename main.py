@@ -207,7 +207,7 @@ async def brain_chat_v8(req: ChatRequest):
         cta = f"\n\nBook a meeting here: {call_link}" if call_link else ""
         sys_msg = f"Role: {conf.get('bot_name')} at {conf.get('biz_name')}. Persona: {conf.get('bot_personality')}. Knowledge: {ctx}. {cta}. Fallback: {conf.get('fallback')}"
         
-        model = genai.GenerativeModel("gemini-2.0-flash")
+        model = genai.GenerativeModel("gemini-2.5-flash")
         ans = model.generate_content(f"{sys_msg}\n\nUSER QUERY: {req.message}").text
         
         # 5. Lead Classification

@@ -17,41 +17,37 @@ from pinecone import Pinecone
 import google.generativeai as genai
 
 # --- 1. SYSTEM CONFIGURATION ---
-# Security: Load keys from Environment Variables (set these in Render)
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
 PINECONE_INDEX_NAME = os.getenv("PINECONE_INDEX_NAME", "chatbot-index")
-
-# Optional: Backend Auth Key for securing your Dashboard <-> Brain connection
 API_AUTH_KEY = os.getenv("BACKEND_API_KEY") 
 
 if not PINECONE_API_KEY:
-    raise RuntimeError("CRITICAL: PINECONE_API_KEY is missing in Environment Variables.")
-
-# Basic Auth Dependency (Optional usage)
-def verify_api_key(x_api_key: str = Header(None)):
-    if API_AUTH_KEY and x_api_key != API_AUTH_KEY:
-        raise HTTPException(status_code=401, detail="Invalid Backend API Key")
+    # FAIL FAST if the environment variable is missing
+    print("CRITICAL ERROR: PINECONE_API_KEY is missing in Render Environment Variables.")
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Omni-Brain v13.0 SaaS Enterprise", version="13.0")
+app = FastAPI(title="Omni-Brain v13.2 Debug Mode", version="13.2")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 # --- DATABASE CONNECTION ---
-try:
-    pc = Pinecone(api_key=PINECONE_API_KEY)
-    index = pc.Index(PINECONE_INDEX_NAME)
-    logger.info("✅ Pinecone DB Connected")
-except Exception as e:
-    logger.error(f"❌ Database Connection Failed: {e}")
-    index = None
+def connect_db():
+    try:
+        pc = Pinecone(api_key=PINECONE_API_KEY)
+        idx = pc.Index(PINECONE_INDEX_NAME)
+        return idx
+    except Exception as e:
+        logger.error(f"❌ DB Connection Failed: {e}")
+        return None
+
+index = connect_db()
 
 # --- DATA MODELS ---
 class TrainRequest(BaseModel):
     client_id: str
     url: str
-    gemini_api_key: str = "" # Optional: If empty, system tries to recall existing key
+    gemini_api_key: str = "" 
     bot_name: str = "AI Assistant"
     bot_lang: str = "English"
     timezone: str = "Auto-detect (IST)"
@@ -84,7 +80,7 @@ class AutoSyncRequest(BaseModel):
     client_id: str
     url: str = ""
 
-# --- HELPER: GENAI RETRY LOGIC ---
+# --- HELPER: GENAI RETRY ---
 async def generate_answer_with_retry(model, prompt, retries=2):
     for attempt in range(retries + 1):
         try:
@@ -93,9 +89,24 @@ async def generate_answer_with_retry(model, prompt, retries=2):
             if attempt == retries: raise
             await asyncio.sleep(0.5 * (attempt + 1))
 
-# --- HELPER: THEME EXTRACTION ---
+# --- HELPER: MEMORY ---
+def get_conversation_history(client_id: str, session_id: str, limit: int = 6):
+    try:
+        dummy = [0.0] * 768
+        res = index.query(
+            namespace=client_id, vector=dummy, top_k=limit, 
+            filter={"type": "chat_log", "session": session_id}, 
+            include_metadata=True
+        )
+        matches = sorted(res.get("matches", []), key=lambda m: m["metadata"].get("timestamp", 0))
+        history = []
+        for m in matches:
+            history.append(f"User: {m['metadata'].get('user','')}\nAI: {m['metadata'].get('bot','')}")
+        return "\n".join(history)
+    except: return ""
+
+# --- HELPER: THEME ---
 async def extract_theme_color(session, url):
-    """Scans host website for brand colors."""
     try:
         async with session.get(url, timeout=10, ssl=False) as resp:
             if resp.status != 200: return "#4F46E5"
@@ -104,29 +115,10 @@ async def extract_theme_color(session, url):
             return meta.get("content") if meta else "#4F46E5"
     except: return "#4F46E5"
 
-# --- HELPER: CONVERSATION MEMORY ---
-def get_conversation_history(client_id: str, session_id: str, limit: int = 6):
-    """Fetches previous chat context for Multi-turn conversation."""
-    try:
-        dummy = [0.0] * 768
-        res = index.query(
-            namespace=client_id, vector=dummy, top_k=limit, 
-            filter={"type": "chat_log", "session": session_id}, 
-            include_metadata=True
-        )
-        # Sort by timestamp ascending
-        matches = sorted(res.get("matches", []), key=lambda m: m["metadata"].get("timestamp", 0))
-        history = []
-        for m in matches:
-            history.append(f"User: {m['metadata'].get('user','')}\nAI: {m['metadata'].get('bot','')}")
-        return "\n".join(history)
-    except: return ""
-
-# --- STEP 1: ROBUST SAAS CRAWLER ---
+# --- STEP 1: SCRAPER ---
 async def deep_scraper_engine(start_url: str, client_id: str, api_key: str, max_pages: int = 40):
     if not start_url.startswith("http"): start_url = f"https://{start_url}"
     
-    # Configure Client Key for this background task
     try:
         genai.configure(api_key=api_key)
     except Exception as e:
@@ -139,7 +131,7 @@ async def deep_scraper_engine(start_url: str, client_id: str, api_key: str, max_
     await queue.put((start_url, 0))
 
     async with aiohttp.ClientSession() as session:
-        # Auto-Theme Update
+        # Auto-Theme
         color = await extract_theme_color(session, start_url)
         try:
             res = index.fetch(ids=[f"config_{client_id}"], namespace=client_id)
@@ -158,33 +150,26 @@ async def deep_scraper_engine(start_url: str, client_id: str, api_key: str, max_
                 async with session.get(url, timeout=15, ssl=False) as resp:
                     if resp.status != 200: continue
                     soup = BeautifulSoup(await resp.text(), 'html.parser')
-                    
-                    # 1. Harvest Links
                     for a in soup.find_all('a', href=True):
                         link = urljoin(url, a['href']).split('#')[0].rstrip('/')
                         if urlparse(link).netloc == domain and link not in visited:
                             await queue.put((link, depth + 1))
-
-                    # 2. Clean HTML
                     for x in soup(['script', 'style', 'nav', 'footer', 'iframe', 'aside']): x.decompose()
                     text = soup.get_text(separator=' ', strip=True)
                     if len(text) < 200: continue
 
-                    # 3. AI Cleaning (Gemini)
                     cleaner = genai.GenerativeModel("gemini-2.5-flash")
-                    clean_text = await generate_answer_with_retry(cleaner, f"Extract business facts only. Remove fluff/navigation. TEXT: {text[:8000]}")
+                    clean_text = await generate_answer_with_retry(cleaner, f"Extract business facts only. Remove fluff. TEXT: {text[:8000]}")
 
-                    # 4. Chunking & Deduplication
                     chunks = [clean_text[i:i+1500] for i in range(0, len(clean_text), 1500)]
                     for i, chunk in enumerate(chunks):
-                        # Hash check
                         h = hashlib.sha256(chunk.encode("utf-8")).hexdigest()
                         if h in seen_hashes: continue
                         seen_hashes.add(h)
 
                         emb = genai.embed_content(model="models/text-embedding-004", content=chunk)['embedding']
                         vectors.append({
-                            "id": f"neural_{uuid.uuid4()}", # Robust ID
+                            "id": f"neural_{uuid.uuid4()}",
                             "values": emb,
                             "metadata": {"text": chunk, "url": url, "type": "knowledge", "hash": h, "source": "recursive_crawl"}
                         })
@@ -195,11 +180,10 @@ async def deep_scraper_engine(start_url: str, client_id: str, api_key: str, max_
             except: continue
     if vectors: index.upsert(vectors=vectors, namespace=client_id)
 
-# --- DOCUMENT UPLOAD ---
+# --- UPLOAD ---
 @app.post("/upload-file")
 async def upload_file_engine(client_id: str, file: UploadFile = File(...)):
     try:
-        # Fetch Key
         res = index.fetch(ids=[f"config_{client_id}"], namespace=client_id)
         if not res.vectors: return {"status": "error", "message": "Train website first."}
         
@@ -227,36 +211,52 @@ async def upload_file_engine(client_id: str, file: UploadFile = File(...)):
         return {"status": "success", "message": f"Learned from {file.filename}"}
     except Exception as e: return {"status": "error", "message": str(e)}
 
-# --- CHAT ENGINE (MEMORY + SECURITY) ---
+# --- CHAT ENGINE (DEBUG MODE) ---
 @app.post("/chat")
 async def saas_brain_chat(req: ChatRequest):
     try:
-        # 1. Fetch Config
-        res = index.fetch(ids=[f"config_{req.client_id}"], namespace=req.client_id)
-        if not res.vectors: return {"answer": "Initializing... please refresh."}
+        # 1. Fetch Config with Error Handling
+        if index is None:
+            return {"answer": "Critical Error: Database not connected. Check server logs."}
+
+        try:
+            res = index.fetch(ids=[f"config_{req.client_id}"], namespace=req.client_id)
+        except Exception as e:
+            logger.error(f"Pinecone Fetch Error: {e}")
+            return {"answer": "Error connecting to memory. Retrying..."}
+
+        if not res.vectors: 
+            return {"answer": "Brain not active. Please click 'Save Changes' in the dashboard to start."}
+        
         conf = res.vectors[f"config_{req.client_id}"].metadata
         
         # 2. Status Check
         if str(conf.get("bot_status", "True")).lower() in ("false", "0", "off"):
             return {"answer": "This assistant is currently offline."}
 
-        # 3. Configure Key
-        api_key = conf.get('api_key')
-        if not api_key: return {"answer": "System Error: API Key missing. Please contact support."}
-        genai.configure(api_key=api_key)
+        # 3. Configure Key (CRASH PREVENTION)
+        api_key = conf.get('api_key', '').strip()
+        if not api_key: 
+            logger.error(f"MISSING API KEY for client {req.client_id}")
+            return {"answer": "Configuration Error: API Key missing. Please update settings."}
+        
+        try:
+            genai.configure(api_key=api_key)
+        except Exception as e:
+            logger.error(f"Gemini Config Error: {e}")
+            return {"answer": "Invalid API Key format."}
 
         await asyncio.sleep(int(conf.get("delay", 1000)) / 1000)
 
-        # 4. Lead Gating (Email)
+        # 4. Lead Gating
         if conf.get("leads_trigger") == "Before sharing pricing" and conf.get("collect_email", True):
              if any(x in req.message.lower() for x in ["price", "cost", "how much", "fees"]):
-                 # Check if lead exists in session
                  dummy = [0.0]*768
                  ex = index.query(namespace=req.client_id, vector=dummy, top_k=1, filter={"type": "lead", "session": req.session_id})
                  if not ex.get("matches"):
                      return {"answer": "I'd be happy to share pricing! Could you please share your email address first?"}
 
-        # 5. Fetch Context (Memory & RAG)
+        # 5. Fetch Context
         history = get_conversation_history(req.client_id, req.session_id)
         
         emb = genai.embed_content(model="models/text-embedding-004", content=req.message)['embedding']
@@ -277,10 +277,10 @@ async def saas_brain_chat(req: ChatRequest):
         HISTORY: {history}
         """
         
-        model = genai.GenerativeModel("gemini-2.0-flash")
+        model = genai.GenerativeModel("gemini-2.5-flash")
         ans = await generate_answer_with_retry(model, f"{sys_msg}\n\nUSER: {req.message}")
 
-        # 7. Secure Logging (UUID)
+        # 7. Secure Logging
         log_id = f"log_{req.session_id}_{uuid.uuid4()}"
         m_type = "lead" if re.search(r"[\w\.-]+@[\w\.-]+", req.message) else "chat_log"
         
@@ -296,16 +296,14 @@ async def saas_brain_chat(req: ChatRequest):
         index.upsert(vectors=[{"id": log_id, "values": [0.1]*768, "metadata": meta}], namespace=req.client_id)
         return {"answer": ans}
     except Exception as e:
-        logger.error(f"Chat failed: {e}")
-        return {"answer": "I'm optimizing my neural links. Try again?"}
+        logger.error(f"CRITICAL CHAT ERROR: {e}") # <<< LOOK AT RENDER LOGS FOR THIS LINE
+        return {"answer": "I'm optimizing my neural links. Please try again in 5 seconds."}
 
-# --- TRAIN ENGINE (KEY PRESERVATION + WIPE) ---
+# --- TRAIN ---
 @app.post("/train")
 async def train_saas_engine(req: TrainRequest, bg: BackgroundTasks):
     try:
-        # 1. KEY LOGIC: "Handshake"
-        # If dashboard sends key, use it. If not, fetch existing from Brain.
-        final_api_key = req.gemini_api_key
+        final_api_key = req.gemini_api_key.strip()
         
         if not final_api_key:
             existing = index.fetch(ids=[f"config_{req.client_id}"], namespace=req.client_id)
@@ -315,11 +313,9 @@ async def train_saas_engine(req: TrainRequest, bg: BackgroundTasks):
         if not final_api_key:
             return {"status": "error", "message": "Critical: No API Key found. Admin must configure it first."}
 
-        # 2. Wipe Old Memory (Safe because we have the key)
         try: index.delete(delete_all=True, namespace=req.client_id)
         except: pass
 
-        # 3. Save Config (Persist Key)
         meta = {
             "type": "config", 
             "api_key": final_api_key, 
@@ -334,12 +330,11 @@ async def train_saas_engine(req: TrainRequest, bg: BackgroundTasks):
         }
         index.upsert(vectors=[{"id": f"config_{req.client_id}", "values": [1.0]*768, "metadata": meta}], namespace=req.client_id)
         
-        # 4. Start Background Crawl
         bg.add_task(deep_scraper_engine, req.url, req.client_id, final_api_key)
         return {"status": "success", "message": "Deep Sync Started."}
     except Exception as e: return {"status": "error", "message": str(e)}
 
-# --- UTILS & STATS ---
+# --- UTILS ---
 @app.post("/get-config")
 async def get_conf(req: AutoSyncRequest):
     try:
@@ -375,4 +370,4 @@ async def verify_engine(req: AutoSyncRequest):
     except: return {"status": "failed"}
 
 @app.get("/")
-def health(): return {"status": "Omni-Brain v13.0 SaaS Active"}
+def health(): return {"status": "Omni-Brain v13.2 Debug Active"}

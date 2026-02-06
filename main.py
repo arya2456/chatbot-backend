@@ -22,13 +22,12 @@ PINECONE_INDEX_NAME = os.getenv("PINECONE_INDEX_NAME", "chatbot-index")
 API_AUTH_KEY = os.getenv("BACKEND_API_KEY") 
 
 if not PINECONE_API_KEY:
-    # FAIL FAST if the environment variable is missing
     print("CRITICAL ERROR: PINECONE_API_KEY is missing in Render Environment Variables.")
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Omni-Brain v13.2 Debug Mode", version="13.2")
+app = FastAPI(title="Omni-Brain v13.6 Avatar Support", version="13.6")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 # --- DATABASE CONNECTION ---
@@ -69,6 +68,7 @@ class TrainRequest(BaseModel):
     fallback_msg: str = "I'm not sure about that. Would you like to speak to a human agent?"
     bot_personality: str = "Professional"
     bot_color: str = "#4F46E5"
+    bot_avatar: str = "" # ADDED: Support for Avatar URL
 
 class ChatRequest(BaseModel):
     message: str
@@ -296,7 +296,7 @@ async def saas_brain_chat(req: ChatRequest):
         index.upsert(vectors=[{"id": log_id, "values": [0.1]*768, "metadata": meta}], namespace=req.client_id)
         return {"answer": ans}
     except Exception as e:
-        logger.error(f"CRITICAL CHAT ERROR: {e}") # <<< LOOK AT RENDER LOGS FOR THIS LINE
+        logger.error(f"CRITICAL CHAT ERROR: {e}")
         return {"answer": "I'm optimizing my neural links. Please try again in 5 seconds."}
 
 # --- TRAIN ---
@@ -326,7 +326,9 @@ async def train_saas_engine(req: TrainRequest, bg: BackgroundTasks):
             "call_link": req.book_call_link if req.book_call_active else "",
             "wa_num": req.whatsapp_number if req.whatsapp_active else "",
             "delay": str(req.response_delay_ms), "fallback": req.fallback_msg,
-            "bot_personality": req.bot_personality, "bot_color": req.bot_color, "url": req.url
+            "bot_personality": req.bot_personality, "bot_color": req.bot_color, 
+            "bot_avatar": req.bot_avatar, # SAVED HERE
+            "url": req.url
         }
         index.upsert(vectors=[{"id": f"config_{req.client_id}", "values": [1.0]*768, "metadata": meta}], namespace=req.client_id)
         
@@ -341,9 +343,14 @@ async def get_conf(req: AutoSyncRequest):
         res = index.fetch(ids=[f"config_{req.client_id}"], namespace=req.client_id)
         if res.vectors:
             d = res.vectors[f"config_{req.client_id}"].metadata
-            return {"bot_name": d.get("bot_name"), "bot_color": d.get("bot_color"), "welcome_msg": f"Hi! I'm {d.get('bot_name')}. How can I help?"}
-        return {"bot_name": "Support", "bot_color": "#4F46E5"}
-    except: return {"bot_name": "Support", "bot_color": "#4F46E5"}
+            return {
+                "bot_name": d.get("bot_name"), 
+                "bot_color": d.get("bot_color"), 
+                "bot_avatar": d.get("bot_avatar", ""), # RETRIEVED HERE
+                "welcome_msg": f"Hi! I'm {d.get('bot_name')}. How can I help?"
+            }
+        return {"bot_name": "Support", "bot_color": "#4F46E5", "bot_avatar": ""}
+    except: return {"bot_name": "Support", "bot_color": "#4F46E5", "bot_avatar": ""}
 
 @app.post("/get-stats")
 def stats_engine(req: AutoSyncRequest):
@@ -370,4 +377,4 @@ async def verify_engine(req: AutoSyncRequest):
     except: return {"status": "failed"}
 
 @app.get("/")
-def health(): return {"status": "Omni-Brain v13.2 Debug Active"}
+def health(): return {"status": "Omni-Brain v13.6 Avatar Support Active"}

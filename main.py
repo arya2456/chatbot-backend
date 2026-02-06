@@ -22,12 +22,12 @@ PINECONE_INDEX_NAME = os.getenv("PINECONE_INDEX_NAME", "chatbot-index")
 API_AUTH_KEY = os.getenv("BACKEND_API_KEY") 
 
 if not PINECONE_API_KEY:
-    print("CRITICAL ERROR: PINECONE_API_KEY is missing in Render Environment Variables.")
+    print("CRITICAL ERROR: PINECONE_API_KEY is missing.")
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Omni-Brain v13.6 Avatar Support", version="13.6")
+app = FastAPI(title="Omni-Brain v13.7 Avatar Support", version="13.7")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 # --- DATABASE CONNECTION ---
@@ -68,7 +68,7 @@ class TrainRequest(BaseModel):
     fallback_msg: str = "I'm not sure about that. Would you like to speak to a human agent?"
     bot_personality: str = "Professional"
     bot_color: str = "#4F46E5"
-    bot_avatar: str = "" # ADDED: Support for Avatar URL
+    bot_avatar: str = "" # <--- CRITICAL UPDATE: ADDED AVATAR FIELD
 
 class ChatRequest(BaseModel):
     message: str
@@ -121,9 +121,7 @@ async def deep_scraper_engine(start_url: str, client_id: str, api_key: str, max_
     
     try:
         genai.configure(api_key=api_key)
-    except Exception as e:
-        logger.error(f"Scraper Config Error: {e}")
-        return
+    except: return
 
     domain = urlparse(start_url).netloc
     visited, vectors, seen_hashes = set(), [], set()
@@ -211,44 +209,32 @@ async def upload_file_engine(client_id: str, file: UploadFile = File(...)):
         return {"status": "success", "message": f"Learned from {file.filename}"}
     except Exception as e: return {"status": "error", "message": str(e)}
 
-# --- CHAT ENGINE (DEBUG MODE) ---
+# --- CHAT ENGINE (FIXED) ---
 @app.post("/chat")
 async def saas_brain_chat(req: ChatRequest):
     try:
-        # 1. Fetch Config with Error Handling
-        if index is None:
-            return {"answer": "Critical Error: Database not connected. Check server logs."}
+        # 1. Fetch Config
+        if index is None: return {"answer": "Critical: Database Error."}
+        try: res = index.fetch(ids=[f"config_{req.client_id}"], namespace=req.client_id)
+        except: return {"answer": "Connection Error. Retrying..."}
 
-        try:
-            res = index.fetch(ids=[f"config_{req.client_id}"], namespace=req.client_id)
-        except Exception as e:
-            logger.error(f"Pinecone Fetch Error: {e}")
-            return {"answer": "Error connecting to memory. Retrying..."}
-
-        if not res.vectors: 
-            return {"answer": "Brain not active. Please click 'Save Changes' in the dashboard to start."}
+        if not res.vectors: return {"answer": "Brain not active. Please click 'Save' in dashboard."}
         
         conf = res.vectors[f"config_{req.client_id}"].metadata
         
-        # 2. Status Check
+        # 2. Status & Key Check
         if str(conf.get("bot_status", "True")).lower() in ("false", "0", "off"):
             return {"answer": "This assistant is currently offline."}
 
-        # 3. Configure Key (CRASH PREVENTION)
         api_key = conf.get('api_key', '').strip()
-        if not api_key: 
-            logger.error(f"MISSING API KEY for client {req.client_id}")
-            return {"answer": "Configuration Error: API Key missing. Please update settings."}
+        if not api_key: return {"answer": "Error: Admin must configure API Key."}
         
-        try:
-            genai.configure(api_key=api_key)
-        except Exception as e:
-            logger.error(f"Gemini Config Error: {e}")
-            return {"answer": "Invalid API Key format."}
+        try: genai.configure(api_key=api_key)
+        except: return {"answer": "Invalid API Key."}
 
         await asyncio.sleep(int(conf.get("delay", 1000)) / 1000)
 
-        # 4. Lead Gating
+        # 3. Lead Gating
         if conf.get("leads_trigger") == "Before sharing pricing" and conf.get("collect_email", True):
              if any(x in req.message.lower() for x in ["price", "cost", "how much", "fees"]):
                  dummy = [0.0]*768
@@ -256,23 +242,16 @@ async def saas_brain_chat(req: ChatRequest):
                  if not ex.get("matches"):
                      return {"answer": "I'd be happy to share pricing! Could you please share your email address first?"}
 
-        # 5. Fetch Context
+        # 4. Generate
         history = get_conversation_history(req.client_id, req.session_id)
-        
         emb = genai.embed_content(model="models/text-embedding-004", content=req.message)['embedding']
         search = index.query(namespace=req.client_id, vector=emb, top_k=6, include_metadata=True, filter={"type": "knowledge"})
         ctx = "\n\n".join([m['metadata']['text'] for m in search['matches']])
 
-        # 6. Strict Prompt
         sys_msg = f"""
         IDENTITY: You are {conf.get('bot_name')} at "{conf.get('biz_name')}". 
         LANGUAGE: Answer strictly in {conf.get('bot_lang', 'English')}.
-        RULES:
-        - 1-3 lines max.
-        - No 'Acme'. No hallucinations.
-        - Use HISTORY to remember names/context.
-        - If missing info: "{conf.get('fallback')}"
-        
+        RULES: 1-3 lines max. No hallucinations. Use HISTORY.
         KNOWLEDGE: {ctx}
         HISTORY: {history}
         """
@@ -280,55 +259,44 @@ async def saas_brain_chat(req: ChatRequest):
         model = genai.GenerativeModel("gemini-2.5-flash")
         ans = await generate_answer_with_retry(model, f"{sys_msg}\n\nUSER: {req.message}")
 
-        # 7. Secure Logging
+        # 5. Log
         log_id = f"log_{req.session_id}_{uuid.uuid4()}"
         m_type = "lead" if re.search(r"[\w\.-]+@[\w\.-]+", req.message) else "chat_log"
-        
-        meta = {
-            "type": m_type, 
-            "user": req.message, 
-            "bot": ans, 
-            "session": req.session_id, 
-            "timestamp": int(time.time()),
-            "email": req.message if m_type == "lead" else ""
-        }
+        meta = {"type": m_type, "user": req.message, "bot": ans, "session": req.session_id, "timestamp": int(time.time()), "email": req.message if m_type == "lead" else ""}
         
         index.upsert(vectors=[{"id": log_id, "values": [0.1]*768, "metadata": meta}], namespace=req.client_id)
         return {"answer": ans}
     except Exception as e:
-        logger.error(f"CRITICAL CHAT ERROR: {e}")
+        logger.error(f"CHAT ERROR: {e}")
         return {"answer": "I'm optimizing my neural links. Please try again in 5 seconds."}
 
-# --- TRAIN ---
+# --- TRAIN (FIXED) ---
 @app.post("/train")
 async def train_saas_engine(req: TrainRequest, bg: BackgroundTasks):
     try:
+        # 1. Handle API Key
         final_api_key = req.gemini_api_key.strip()
-        
         if not final_api_key:
             existing = index.fetch(ids=[f"config_{req.client_id}"], namespace=req.client_id)
             if existing.vectors:
                 final_api_key = existing.vectors[f"config_{req.client_id}"].metadata.get("api_key")
         
-        if not final_api_key:
-            return {"status": "error", "message": "Critical: No API Key found. Admin must configure it first."}
+        if not final_api_key: return {"status": "error", "message": "No API Key found."}
 
+        # 2. Wipe & Save
         try: index.delete(delete_all=True, namespace=req.client_id)
         except: pass
 
         meta = {
-            "type": "config", 
-            "api_key": final_api_key, 
+            "type": "config", "api_key": final_api_key, 
             "bot_name": req.bot_name, "bot_lang": req.bot_lang, 
             "bot_status": str(req.bot_status), "biz_name": req.biz_name, 
             "biz_phone": req.biz_phone, "biz_email": req.biz_email,
             "leads_trigger": req.trigger_strategy, "collect_email": req.collect_email,
-            "call_link": req.book_call_link if req.book_call_active else "",
-            "wa_num": req.whatsapp_number if req.whatsapp_active else "",
+            "call_link": req.book_call_link, "wa_num": req.whatsapp_number,
             "delay": str(req.response_delay_ms), "fallback": req.fallback_msg,
-            "bot_personality": req.bot_personality, "bot_color": req.bot_color, 
-            "bot_avatar": req.bot_avatar, # SAVED HERE
-            "url": req.url
+            "bot_personality": req.bot_personality, "bot_color": req.bot_color, "url": req.url,
+            "bot_avatar": req.bot_avatar # <--- SAVES AVATAR TO BRAIN
         }
         index.upsert(vectors=[{"id": f"config_{req.client_id}", "values": [1.0]*768, "metadata": meta}], namespace=req.client_id)
         
@@ -336,7 +304,7 @@ async def train_saas_engine(req: TrainRequest, bg: BackgroundTasks):
         return {"status": "success", "message": "Deep Sync Started."}
     except Exception as e: return {"status": "error", "message": str(e)}
 
-# --- UTILS ---
+# --- UTILS (FIXED) ---
 @app.post("/get-config")
 async def get_conf(req: AutoSyncRequest):
     try:
@@ -344,13 +312,12 @@ async def get_conf(req: AutoSyncRequest):
         if res.vectors:
             d = res.vectors[f"config_{req.client_id}"].metadata
             return {
-                "bot_name": d.get("bot_name"), 
-                "bot_color": d.get("bot_color"), 
-                "bot_avatar": d.get("bot_avatar", ""), # RETRIEVED HERE
+                "bot_name": d.get("bot_name"), "bot_color": d.get("bot_color"),
+                "bot_avatar": d.get("bot_avatar", ""), # <--- SENDS AVATAR TO WIDGET
                 "welcome_msg": f"Hi! I'm {d.get('bot_name')}. How can I help?"
             }
-        return {"bot_name": "Support", "bot_color": "#4F46E5", "bot_avatar": ""}
-    except: return {"bot_name": "Support", "bot_color": "#4F46E5", "bot_avatar": ""}
+        return {"bot_name": "Support", "bot_color": "#4F46E5"}
+    except: return {"bot_name": "Support", "bot_color": "#4F46E5"}
 
 @app.post("/get-stats")
 def stats_engine(req: AutoSyncRequest):
@@ -377,4 +344,4 @@ async def verify_engine(req: AutoSyncRequest):
     except: return {"status": "failed"}
 
 @app.get("/")
-def health(): return {"status": "Omni-Brain v13.6 Avatar Support Active"}
+def health(): return {"status": "Omni-Brain v13.7 Active"}

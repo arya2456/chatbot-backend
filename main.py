@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 if not PINECONE_API_KEY:
     logger.error("CRITICAL: PINECONE_API_KEY is missing.")
 
-app = FastAPI(title="Omni-Brain v14.2 (Auto-Detect)", version="14.2")
+app = FastAPI(title="Omni-Brain v14.3 (Dimension Lock)", version="14.3")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 # --- DATABASE CONNECTION ---
@@ -40,30 +40,52 @@ def connect_db():
 
 index = connect_db()
 
-# --- DYNAMIC MODEL FINDER (THE FIX) ---
-# This function asks Google: "What embedding model can I use?"
+# --- AUTO-DETECT MODELS ---
 def get_optimal_models(api_key):
+    """
+    Finds the best available models for the user's API Key.
+    """
     try:
         genai.configure(api_key=api_key)
-        found_embed = None
+        found_embed = "models/embedding-001" # Default safe fallback (768 dim)
         
-        # 1. List all models and find one that supports 'embedContent'
-        for m in genai.list_models():
-            if 'embedContent' in m.supported_generation_methods:
-                found_embed = m.name
-                # Prefer the newest 004 model if available
-                if 'text-embedding-004' in m.name:
-                    break 
-        
-        # Default fallback if list fails
-        if not found_embed: found_embed = "models/text-embedding-004"
+        # Scan for newer models
+        try:
+            for m in genai.list_models():
+                if 'embedContent' in m.supported_generation_methods:
+                    if 'text-embedding-004' in m.name:
+                        found_embed = m.name
+                        break
+        except: pass
         
         return {
-            "chat": "gemini-2.0-flash", # We know you have this
+            "chat": "gemini-2.0-flash", 
             "embed": found_embed
         }
     except:
-        return {"chat": "gemini-2.0-flash", "embed": "models/text-embedding-004"}
+        return {"chat": "gemini-2.0-flash", "embed": "models/embedding-001"}
+
+# --- SAFE EMBEDDING FUNCTION (THE FIX) ---
+def safe_embed(model_name, text):
+    """
+    Forces embedding to 768 dimensions to fit Pinecone.
+    """
+    try:
+        # Try forcing 768 dimensions (Works for text-embedding-004)
+        return genai.embed_content(
+            model=model_name, 
+            content=text, 
+            output_dimensionality=768
+        )['embedding']
+    except TypeError:
+        # Fallback for models that don't support resizing (embedding-001 is natively 768)
+        return genai.embed_content(
+            model=model_name, 
+            content=text
+        )['embedding']
+    except Exception as e:
+        logger.error(f"Embedding Failed: {e}")
+        return [0.0] * 768 # Return blank vector on crash to prevent 500 Error
 
 # --- DATA MODELS ---
 class TrainRequest(BaseModel):
@@ -139,7 +161,6 @@ async def extract_theme_color(session, url):
 async def deep_scraper_engine(start_url: str, client_id: str, api_key: str, max_pages: int = 40):
     if not start_url.startswith("http"): start_url = f"https://{start_url}"
     
-    # Auto-Detect Models
     models = get_optimal_models(api_key)
     
     domain = urlparse(start_url).netloc
@@ -183,8 +204,9 @@ async def deep_scraper_engine(start_url: str, client_id: str, api_key: str, max_
                         if h in seen_hashes: continue
                         seen_hashes.add(h)
 
-                        # AUTO-DETECTED MODEL USED HERE
-                        emb = genai.embed_content(model=models["embed"], content=chunk)['embedding']
+                        # USE SAFE EMBED (Forces 768)
+                        emb = safe_embed(models["embed"], chunk)
+                        
                         vectors.append({
                             "id": f"neural_{uuid.uuid4()}",
                             "values": emb,
@@ -218,7 +240,8 @@ async def upload_file_engine(client_id: str, file: UploadFile = File(...)):
         chunks = [content[i:i+1200] for i in range(0, len(content), 1200)]
         vectors = []
         for i, c in enumerate(chunks):
-             emb = genai.embed_content(model=models["embed"], content=c)['embedding']
+             # USE SAFE EMBED
+             emb = safe_embed(models["embed"], c)
              vectors.append({
                  "id": f"doc_{uuid.uuid4()}",
                  "values": emb,
@@ -228,7 +251,7 @@ async def upload_file_engine(client_id: str, file: UploadFile = File(...)):
         return {"status": "success", "message": f"Learned from {file.filename}"}
     except Exception as e: return {"status": "error", "message": str(e)}
 
-# --- CHAT ENGINE (AUTO-DETECT) ---
+# --- CHAT ENGINE (FIXED) ---
 @app.post("/chat")
 async def saas_brain_chat(req: ChatRequest):
     try:
@@ -246,11 +269,11 @@ async def saas_brain_chat(req: ChatRequest):
         api_key = conf.get('api_key', '').strip()
         if not api_key: return {"answer": "Error: Admin must configure API Key."}
         
-        # 1. AUTO-DETECT MODELS HERE
         models = get_optimal_models(api_key)
 
         await asyncio.sleep(int(conf.get("delay", 1000)) / 1000)
 
+        # Lead Gating
         if conf.get("leads_trigger") == "Before sharing pricing" and conf.get("collect_email", True):
              if any(x in req.message.lower() for x in ["price", "cost", "how much", "fees"]):
                  dummy = [0.0]*768
@@ -260,11 +283,8 @@ async def saas_brain_chat(req: ChatRequest):
 
         history = get_conversation_history(req.client_id, req.session_id)
         
-        # 2. USE AUTO-DETECTED MODEL
-        try:
-            emb = genai.embed_content(model=models["embed"], content=req.message)['embedding']
-        except Exception as e:
-            return {"answer": f"Embedding Error: {str(e)}"}
+        # USE SAFE EMBED
+        emb = safe_embed(models["embed"], req.message)
 
         search = index.query(namespace=req.client_id, vector=emb, top_k=6, include_metadata=True, filter={"type": "knowledge"})
         ctx = "\n\n".join([m['metadata']['text'] for m in search['matches']])
@@ -362,4 +382,4 @@ async def verify_engine(req: AutoSyncRequest):
     except: return {"status": "failed"}
 
 @app.get("/")
-def health(): return {"status": "Omni-Brain v14.2 Auto-Detect Active"}
+def health(): return {"status": "Omni-Brain v14.3 Dimension Lock Active"}

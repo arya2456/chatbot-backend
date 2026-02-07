@@ -156,7 +156,7 @@ async def deep_scraper_engine(start_url: str, client_id: str, api_key: str, max_
                     text = soup.get_text(separator=' ', strip=True)
                     if len(text) < 200: continue
 
-                    cleaner = genai.GenerativeModel("gemini-2.5-flash")
+                    cleaner = genai.GenerativeModel("gemini-1.5-flash")
                     clean_text = await generate_answer_with_retry(cleaner, f"Extract business facts only. Remove fluff. TEXT: {text[:8000]}")
 
                     chunks = [clean_text[i:i+1500] for i in range(0, len(clean_text), 1500)]
@@ -256,7 +256,7 @@ async def saas_brain_chat(req: ChatRequest):
         HISTORY: {history}
         """
         
-        model = genai.GenerativeModel("gemini-2.5-flash")
+        model = genai.GenerativeModel("gemini-1.5-flash")
         ans = await generate_answer_with_retry(model, f"{sys_msg}\n\nUSER: {req.message}")
 
         # 5. Log

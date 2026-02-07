@@ -27,7 +27,7 @@ if not PINECONE_API_KEY:
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Omni-Brain v14.0 (Gemini 2.0 + Avatars)", version="14.0")
+app = FastAPI(title="Omni-Brain v14.1 (Universal Embeddings)", version="14.1")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 # --- DATABASE CONNECTION ---
@@ -68,7 +68,7 @@ class TrainRequest(BaseModel):
     fallback_msg: str = "I'm not sure about that. Would you like to speak to a human agent?"
     bot_personality: str = "Professional"
     bot_color: str = "#4F46E5"
-    bot_avatar: str = "" # Fixed: Avatar field handles image URLs
+    bot_avatar: str = "" 
 
 class ChatRequest(BaseModel):
     message: str
@@ -115,7 +115,7 @@ async def extract_theme_color(session, url):
             return meta.get("content") if meta else "#4F46E5"
     except: return "#4F46E5"
 
-# --- STEP 1: SCRAPER (UPDATED MODEL) ---
+# --- STEP 1: SCRAPER ---
 async def deep_scraper_engine(start_url: str, client_id: str, api_key: str, max_pages: int = 40):
     if not start_url.startswith("http"): start_url = f"https://{start_url}"
     
@@ -155,7 +155,7 @@ async def deep_scraper_engine(start_url: str, client_id: str, api_key: str, max_
                     text = soup.get_text(separator=' ', strip=True)
                     if len(text) < 200: continue
 
-                    # UPDATE: Using gemini-2.0-flash as per your list
+                    # Chat Model: Gemini 2.0 Flash (Fast & Smart)
                     cleaner = genai.GenerativeModel("gemini-2.0-flash")
                     clean_text = await generate_answer_with_retry(cleaner, f"Extract business facts only. Remove fluff. TEXT: {text[:8000]}")
 
@@ -165,7 +165,8 @@ async def deep_scraper_engine(start_url: str, client_id: str, api_key: str, max_
                         if h in seen_hashes: continue
                         seen_hashes.add(h)
 
-                        emb = genai.embed_content(model="models/text-embedding-004", content=chunk)['embedding']
+                        # FIXED: Switched to Universal Embedding Model 001
+                        emb = genai.embed_content(model="models/embedding-001", content=chunk)['embedding']
                         vectors.append({
                             "id": f"neural_{uuid.uuid4()}",
                             "values": emb,
@@ -199,7 +200,8 @@ async def upload_file_engine(client_id: str, file: UploadFile = File(...)):
         chunks = [content[i:i+1200] for i in range(0, len(content), 1200)]
         vectors = []
         for i, c in enumerate(chunks):
-             emb = genai.embed_content(model="models/text-embedding-004", content=c)['embedding']
+             # FIXED: Switched to Universal Embedding Model 001
+             emb = genai.embed_content(model="models/embedding-001", content=c)['embedding']
              vectors.append({
                  "id": f"doc_{uuid.uuid4()}",
                  "values": emb,
@@ -209,7 +211,7 @@ async def upload_file_engine(client_id: str, file: UploadFile = File(...)):
         return {"status": "success", "message": f"Learned from {file.filename}"}
     except Exception as e: return {"status": "error", "message": str(e)}
 
-# --- CHAT ENGINE (UPDATED MODEL) ---
+# --- CHAT ENGINE (FIXED) ---
 @app.post("/chat")
 async def saas_brain_chat(req: ChatRequest):
     try:
@@ -244,7 +246,13 @@ async def saas_brain_chat(req: ChatRequest):
 
         # 4. Generate
         history = get_conversation_history(req.client_id, req.session_id)
-        emb = genai.embed_content(model="models/text-embedding-004", content=req.message)['embedding']
+        
+        # FIXED: Switched to Universal Embedding Model 001
+        try:
+            emb = genai.embed_content(model="models/embedding-001", content=req.message)['embedding']
+        except Exception as e:
+            return {"answer": f"API Error: {str(e)}"}
+
         search = index.query(namespace=req.client_id, vector=emb, top_k=6, include_metadata=True, filter={"type": "knowledge"})
         ctx = "\n\n".join([m['metadata']['text'] for m in search['matches']])
 
@@ -256,7 +264,7 @@ async def saas_brain_chat(req: ChatRequest):
         HISTORY: {history}
         """
         
-        # UPDATE: Using gemini-2.0-flash as it is in your available models list
+        # Chat Model: Gemini 2.0 Flash
         model = genai.GenerativeModel("gemini-2.0-flash")
         ans = await generate_answer_with_retry(model, f"{sys_msg}\n\nUSER: {req.message}")
 
@@ -271,7 +279,7 @@ async def saas_brain_chat(req: ChatRequest):
         logger.error(f"CHAT ERROR: {e}")
         return {"answer": f"System Error: {str(e)}"}
 
-# --- TRAIN (SAVES AVATAR) ---
+# --- TRAIN ---
 @app.post("/train")
 async def train_saas_engine(req: TrainRequest, bg: BackgroundTasks):
     try:
@@ -295,7 +303,7 @@ async def train_saas_engine(req: TrainRequest, bg: BackgroundTasks):
             "call_link": req.book_call_link, "wa_num": req.whatsapp_number,
             "delay": str(req.response_delay_ms), "fallback": req.fallback_msg,
             "bot_personality": req.bot_personality, "bot_color": req.bot_color, "url": req.url,
-            "bot_avatar": req.bot_avatar # <--- Saved successfully here
+            "bot_avatar": req.bot_avatar
         }
         index.upsert(vectors=[{"id": f"config_{req.client_id}", "values": [1.0]*768, "metadata": meta}], namespace=req.client_id)
         
@@ -303,7 +311,7 @@ async def train_saas_engine(req: TrainRequest, bg: BackgroundTasks):
         return {"status": "success", "message": "Deep Sync Started."}
     except Exception as e: return {"status": "error", "message": str(e)}
 
-# --- UTILS (RETURNS AVATAR) ---
+# --- UTILS ---
 @app.post("/get-config")
 async def get_conf(req: AutoSyncRequest):
     try:
@@ -312,7 +320,7 @@ async def get_conf(req: AutoSyncRequest):
             d = res.vectors[f"config_{req.client_id}"].metadata
             return {
                 "bot_name": d.get("bot_name"), "bot_color": d.get("bot_color"),
-                "bot_avatar": d.get("bot_avatar", ""), # <--- Returned to Widget
+                "bot_avatar": d.get("bot_avatar", ""),
                 "welcome_msg": f"Hi! I'm {d.get('bot_name')}. How can I help?"
             }
         return {"bot_name": "Support", "bot_color": "#4F46E5", "bot_avatar": ""}
@@ -343,4 +351,4 @@ async def verify_engine(req: AutoSyncRequest):
     except: return {"status": "failed"}
 
 @app.get("/")
-def health(): return {"status": "Omni-Brain v14.0 Active"}
+def health(): return {"status": "Omni-Brain v14.1 Universal Active"}

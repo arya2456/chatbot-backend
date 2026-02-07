@@ -19,28 +19,51 @@ import google.generativeai as genai
 # --- 1. SYSTEM CONFIGURATION ---
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
 PINECONE_INDEX_NAME = os.getenv("PINECONE_INDEX_NAME", "chatbot-index")
-API_AUTH_KEY = os.getenv("BACKEND_API_KEY") 
-
-if not PINECONE_API_KEY:
-    print("CRITICAL ERROR: PINECONE_API_KEY is missing.")
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Omni-Brain v14.1 (Universal Embeddings)", version="14.1")
+if not PINECONE_API_KEY:
+    logger.error("CRITICAL: PINECONE_API_KEY is missing.")
+
+app = FastAPI(title="Omni-Brain v14.2 (Auto-Detect)", version="14.2")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 # --- DATABASE CONNECTION ---
 def connect_db():
     try:
         pc = Pinecone(api_key=PINECONE_API_KEY)
-        idx = pc.Index(PINECONE_INDEX_NAME)
-        return idx
+        return pc.Index(PINECONE_INDEX_NAME)
     except Exception as e:
         logger.error(f"❌ DB Connection Failed: {e}")
         return None
 
 index = connect_db()
+
+# --- DYNAMIC MODEL FINDER (THE FIX) ---
+# This function asks Google: "What embedding model can I use?"
+def get_optimal_models(api_key):
+    try:
+        genai.configure(api_key=api_key)
+        found_embed = None
+        
+        # 1. List all models and find one that supports 'embedContent'
+        for m in genai.list_models():
+            if 'embedContent' in m.supported_generation_methods:
+                found_embed = m.name
+                # Prefer the newest 004 model if available
+                if 'text-embedding-004' in m.name:
+                    break 
+        
+        # Default fallback if list fails
+        if not found_embed: found_embed = "models/text-embedding-004"
+        
+        return {
+            "chat": "gemini-2.0-flash", # We know you have this
+            "embed": found_embed
+        }
+    except:
+        return {"chat": "gemini-2.0-flash", "embed": "models/text-embedding-004"}
 
 # --- DATA MODELS ---
 class TrainRequest(BaseModel):
@@ -68,7 +91,7 @@ class TrainRequest(BaseModel):
     fallback_msg: str = "I'm not sure about that. Would you like to speak to a human agent?"
     bot_personality: str = "Professional"
     bot_color: str = "#4F46E5"
-    bot_avatar: str = "" 
+    bot_avatar: str = ""
 
 class ChatRequest(BaseModel):
     message: str
@@ -99,10 +122,7 @@ def get_conversation_history(client_id: str, session_id: str, limit: int = 6):
             include_metadata=True
         )
         matches = sorted(res.get("matches", []), key=lambda m: m["metadata"].get("timestamp", 0))
-        history = []
-        for m in matches:
-            history.append(f"User: {m['metadata'].get('user','')}\nAI: {m['metadata'].get('bot','')}")
-        return "\n".join(history)
+        return "\n".join([f"User: {m['metadata'].get('user','')}\nAI: {m['metadata'].get('bot','')}" for m in matches])
     except: return ""
 
 # --- HELPER: THEME ---
@@ -119,10 +139,9 @@ async def extract_theme_color(session, url):
 async def deep_scraper_engine(start_url: str, client_id: str, api_key: str, max_pages: int = 40):
     if not start_url.startswith("http"): start_url = f"https://{start_url}"
     
-    try:
-        genai.configure(api_key=api_key)
-    except: return
-
+    # Auto-Detect Models
+    models = get_optimal_models(api_key)
+    
     domain = urlparse(start_url).netloc
     visited, vectors, seen_hashes = set(), [], set()
     queue = asyncio.Queue()
@@ -155,8 +174,7 @@ async def deep_scraper_engine(start_url: str, client_id: str, api_key: str, max_
                     text = soup.get_text(separator=' ', strip=True)
                     if len(text) < 200: continue
 
-                    # Chat Model: Gemini 2.0 Flash (Fast & Smart)
-                    cleaner = genai.GenerativeModel("gemini-2.0-flash")
+                    cleaner = genai.GenerativeModel(models["chat"])
                     clean_text = await generate_answer_with_retry(cleaner, f"Extract business facts only. Remove fluff. TEXT: {text[:8000]}")
 
                     chunks = [clean_text[i:i+1500] for i in range(0, len(clean_text), 1500)]
@@ -165,8 +183,8 @@ async def deep_scraper_engine(start_url: str, client_id: str, api_key: str, max_
                         if h in seen_hashes: continue
                         seen_hashes.add(h)
 
-                        # FIXED: Switched to Universal Embedding Model 001
-                        emb = genai.embed_content(model="models/embedding-001", content=chunk)['embedding']
+                        # AUTO-DETECTED MODEL USED HERE
+                        emb = genai.embed_content(model=models["embed"], content=chunk)['embedding']
                         vectors.append({
                             "id": f"neural_{uuid.uuid4()}",
                             "values": emb,
@@ -189,7 +207,7 @@ async def upload_file_engine(client_id: str, file: UploadFile = File(...)):
         api_key = res.vectors[f"config_{client_id}"].metadata.get('api_key')
         if not api_key: return {"status": "error", "message": "API Key missing."}
         
-        genai.configure(api_key=api_key)
+        models = get_optimal_models(api_key)
 
         content = ""
         if file.content_type == "application/pdf":
@@ -200,8 +218,7 @@ async def upload_file_engine(client_id: str, file: UploadFile = File(...)):
         chunks = [content[i:i+1200] for i in range(0, len(content), 1200)]
         vectors = []
         for i, c in enumerate(chunks):
-             # FIXED: Switched to Universal Embedding Model 001
-             emb = genai.embed_content(model="models/embedding-001", content=c)['embedding']
+             emb = genai.embed_content(model=models["embed"], content=c)['embedding']
              vectors.append({
                  "id": f"doc_{uuid.uuid4()}",
                  "values": emb,
@@ -211,11 +228,10 @@ async def upload_file_engine(client_id: str, file: UploadFile = File(...)):
         return {"status": "success", "message": f"Learned from {file.filename}"}
     except Exception as e: return {"status": "error", "message": str(e)}
 
-# --- CHAT ENGINE (FIXED) ---
+# --- CHAT ENGINE (AUTO-DETECT) ---
 @app.post("/chat")
 async def saas_brain_chat(req: ChatRequest):
     try:
-        # 1. Fetch Config
         if index is None: return {"answer": "Critical: Database Error."}
         try: res = index.fetch(ids=[f"config_{req.client_id}"], namespace=req.client_id)
         except: return {"answer": "Connection Error. Retrying..."}
@@ -224,19 +240,17 @@ async def saas_brain_chat(req: ChatRequest):
         
         conf = res.vectors[f"config_{req.client_id}"].metadata
         
-        # 2. Status & Key Check
         if str(conf.get("bot_status", "True")).lower() in ("false", "0", "off"):
             return {"answer": "This assistant is currently offline."}
 
         api_key = conf.get('api_key', '').strip()
         if not api_key: return {"answer": "Error: Admin must configure API Key."}
         
-        try: genai.configure(api_key=api_key)
-        except: return {"answer": "Invalid API Key."}
+        # 1. AUTO-DETECT MODELS HERE
+        models = get_optimal_models(api_key)
 
         await asyncio.sleep(int(conf.get("delay", 1000)) / 1000)
 
-        # 3. Lead Gating
         if conf.get("leads_trigger") == "Before sharing pricing" and conf.get("collect_email", True):
              if any(x in req.message.lower() for x in ["price", "cost", "how much", "fees"]):
                  dummy = [0.0]*768
@@ -244,14 +258,13 @@ async def saas_brain_chat(req: ChatRequest):
                  if not ex.get("matches"):
                      return {"answer": "I'd be happy to share pricing! Could you please share your email address first?"}
 
-        # 4. Generate
         history = get_conversation_history(req.client_id, req.session_id)
         
-        # FIXED: Switched to Universal Embedding Model 001
+        # 2. USE AUTO-DETECTED MODEL
         try:
-            emb = genai.embed_content(model="models/embedding-001", content=req.message)['embedding']
+            emb = genai.embed_content(model=models["embed"], content=req.message)['embedding']
         except Exception as e:
-            return {"answer": f"API Error: {str(e)}"}
+            return {"answer": f"Embedding Error: {str(e)}"}
 
         search = index.query(namespace=req.client_id, vector=emb, top_k=6, include_metadata=True, filter={"type": "knowledge"})
         ctx = "\n\n".join([m['metadata']['text'] for m in search['matches']])
@@ -264,16 +277,14 @@ async def saas_brain_chat(req: ChatRequest):
         HISTORY: {history}
         """
         
-        # Chat Model: Gemini 2.0 Flash
-        model = genai.GenerativeModel("gemini-2.0-flash")
+        model = genai.GenerativeModel(models["chat"])
         ans = await generate_answer_with_retry(model, f"{sys_msg}\n\nUSER: {req.message}")
 
-        # 5. Log
         log_id = f"log_{req.session_id}_{uuid.uuid4()}"
         m_type = "lead" if re.search(r"[\w\.-]+@[\w\.-]+", req.message) else "chat_log"
         meta = {"type": m_type, "user": req.message, "bot": ans, "session": req.session_id, "timestamp": int(time.time()), "email": req.message if m_type == "lead" else ""}
-        
         index.upsert(vectors=[{"id": log_id, "values": [0.1]*768, "metadata": meta}], namespace=req.client_id)
+        
         return {"answer": ans}
     except Exception as e:
         logger.error(f"CHAT ERROR: {e}")
@@ -351,4 +362,4 @@ async def verify_engine(req: AutoSyncRequest):
     except: return {"status": "failed"}
 
 @app.get("/")
-def health(): return {"status": "Omni-Brain v14.1 Universal Active"}
+def health(): return {"status": "Omni-Brain v14.2 Auto-Detect Active"}

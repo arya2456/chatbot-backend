@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 if not PINECONE_API_KEY:
     logger.error("CRITICAL: PINECONE_API_KEY is missing.")
 
-app = FastAPI(title="Omni-Brain v15.1 (Production BYOK)", version="15.1")
+app = FastAPI(title="Omni-Brain v15.2 (Diagnostic)", version="15.2")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 # --- DATABASE CONNECTION ---
@@ -42,13 +42,9 @@ index = connect_db()
 
 # --- DYNAMIC MODEL FINDER ---
 def get_optimal_models(api_key):
-    """
-    Checks what models the CLIENT'S specific key allows.
-    """
     try:
         genai.configure(api_key=api_key)
-        found_embed = "models/embedding-001" # Default safe fallback
-        
+        found_embed = "models/embedding-001"
         try:
             for m in genai.list_models():
                 if 'embedContent' in m.supported_generation_methods:
@@ -56,16 +52,14 @@ def get_optimal_models(api_key):
                         found_embed = m.name
                         break
         except: pass
-        
-        return {
-            "chat": "gemini-2.0-flash", 
-            "embed": found_embed
-        }
+        return {"chat": "gemini-2.0-flash", "embed": found_embed}
     except:
         return {"chat": "gemini-2.0-flash", "embed": "models/embedding-001"}
 
 # --- SAFE EMBEDDING FUNCTION ---
-def safe_embed(model_name, text):
+def safe_embed(model_name, text, api_key):
+    # FORCE CONFIGURATION before embedding
+    genai.configure(api_key=api_key)
     try:
         if "004" in model_name:
             return genai.embed_content(model=model_name, content=text, output_dimensionality=768)['embedding']
@@ -74,6 +68,7 @@ def safe_embed(model_name, text):
     except Exception as e:
         logger.error(f"Embedding Error: {e}")
         try:
+            # Fallback to universal
             return genai.embed_content(model="models/embedding-001", content=text)['embedding']
         except:
             return [0.0] * 768
@@ -141,8 +136,11 @@ def get_conversation_history(client_id: str, session_id: str, limit: int = 6):
 # --- STEP 1: SCRAPER ---
 async def deep_scraper_engine(start_url: str, client_id: str, api_key: str, max_pages: int = 40):
     if not start_url.startswith("http"): start_url = f"https://{start_url}"
-    
     models = get_optimal_models(api_key)
+    
+    # FORCE CONFIG
+    genai.configure(api_key=api_key)
+
     domain = urlparse(start_url).netloc
     visited, vectors, seen_hashes = set(), [], set()
     queue = asyncio.Queue()
@@ -180,10 +178,9 @@ async def deep_scraper_engine(start_url: str, client_id: str, api_key: str, max_
                         if h in seen_hashes: continue
                         seen_hashes.add(h)
 
-                        emb = safe_embed(models["embed"], chunk)
+                        emb = safe_embed(models["embed"], chunk, api_key)
                         vectors.append({
-                            "id": f"neural_{uuid.uuid4()}",
-                            "values": emb,
+                            "id": f"neural_{uuid.uuid4()}", "values": emb,
                             "metadata": {"text": chunk, "url": url, "type": "knowledge", "hash": h, "source": "recursive_crawl"}
                         })
                     
@@ -199,12 +196,10 @@ async def upload_file_engine(client_id: str, file: UploadFile = File(...)):
     try:
         res = index.fetch(ids=[f"config_{client_id}"], namespace=client_id)
         if not res.vectors: return {"status": "error", "message": "Train website first."}
-        
         api_key = res.vectors[f"config_{client_id}"].metadata.get('api_key')
         if not api_key: return {"status": "error", "message": "API Key missing."}
         
         models = get_optimal_models(api_key)
-
         content = ""
         if file.content_type == "application/pdf":
             reader = pypdf.PdfReader(io.BytesIO(await file.read()))
@@ -214,23 +209,18 @@ async def upload_file_engine(client_id: str, file: UploadFile = File(...)):
         chunks = [content[i:i+1200] for i in range(0, len(content), 1200)]
         vectors = []
         for i, c in enumerate(chunks):
-             emb = safe_embed(models["embed"], c)
-             vectors.append({
-                 "id": f"doc_{uuid.uuid4()}",
-                 "values": emb,
-                 "metadata": {"text": c, "source": file.filename, "type": "knowledge", "category": "uploaded_document"}
-             })
+             emb = safe_embed(models["embed"], c, api_key)
+             vectors.append({"id": f"doc_{uuid.uuid4()}", "values": emb, "metadata": {"text": c, "source": file.filename, "type": "knowledge"}})
         index.upsert(vectors=vectors, namespace=client_id)
         return {"status": "success", "message": f"Learned from {file.filename}"}
     except Exception as e: return {"status": "error", "message": str(e)}
 
-# --- CHAT ENGINE (SCALABLE BYOK) ---
+# --- CHAT ENGINE (DEBUG MODE) ---
 @app.post("/chat")
 async def saas_brain_chat(req: ChatRequest):
     try:
         if index is None: return {"answer": "Critical: Database Error."}
         
-        # 1. FETCH CLIENT CONFIG (Including Key)
         try: res = index.fetch(ids=[f"config_{req.client_id}"], namespace=req.client_id)
         except: return {"answer": "Connection Error. Retrying..."}
 
@@ -241,13 +231,16 @@ async def saas_brain_chat(req: ChatRequest):
         if str(conf.get("bot_status", "True")).lower() in ("false", "0", "off"):
             return {"answer": "This assistant is currently offline."}
 
-        # 2. EXTRACT KEY FROM DATABASE
         api_key = conf.get('api_key', '').strip()
         if not api_key: return {"answer": "Error: Admin must configure API Key in Dashboard."}
         
-        # 3. DYNAMICALLY CONFIGURE FOR THIS REQUEST ONLY
-        models = get_optimal_models(api_key)
+        # --- SECRET DEBUG COMMAND ---
+        if req.message.strip() == "DEBUG_KEY":
+            last_4 = api_key[-4:] if len(api_key) > 4 else "****"
+            return {"answer": f"🔍 **Diagnostic Mode**\n\nI am currently using API Key ending in: **{last_4}**\n\nPlease verify this matches your Google AI Studio key."}
+        # ----------------------------
 
+        models = get_optimal_models(api_key)
         await asyncio.sleep(int(conf.get("delay", 1000)) / 1000)
 
         # Lead Gating
@@ -260,8 +253,8 @@ async def saas_brain_chat(req: ChatRequest):
 
         history = get_conversation_history(req.client_id, req.session_id)
         
-        # Embedding
-        emb = safe_embed(models["embed"], req.message)
+        # USE SAFE EMBED
+        emb = safe_embed(models["embed"], req.message, api_key)
 
         search = index.query(namespace=req.client_id, vector=emb, top_k=6, include_metadata=True, filter={"type": "knowledge"})
         ctx = "\n\n".join([m['metadata']['text'] for m in search['matches']])
@@ -273,6 +266,9 @@ async def saas_brain_chat(req: ChatRequest):
         KNOWLEDGE: {ctx}
         HISTORY: {history}
         """
+        
+        # FORCE CONFIG AGAIN JUST IN CASE
+        genai.configure(api_key=api_key)
         
         model = genai.GenerativeModel(models["chat"])
         ans = await generate_answer_with_retry(model, f"{sys_msg}\n\nUSER: {req.message}")
@@ -287,10 +283,10 @@ async def saas_brain_chat(req: ChatRequest):
         logger.error(f"CHAT ERROR: {e}")
         error_msg = str(e)
         if "429" in error_msg:
-            return {"answer": "System Error: Your API Key quota is full. Please add billing to your Google Cloud account."}
+            return {"answer": "⚠️ **System Limit Reached**\n\nThe Google API Key you provided has exhausted its daily free quota. Please upgrade the Google Cloud project to 'Pay-As-You-Go' to restore service."}
         return {"answer": f"System Error: {error_msg}"}
 
-# --- TRAIN (SAVES KEY TO DB) ---
+# --- TRAIN ---
 @app.post("/train")
 async def train_saas_engine(req: TrainRequest, bg: BackgroundTasks):
     try:
@@ -308,8 +304,7 @@ async def train_saas_engine(req: TrainRequest, bg: BackgroundTasks):
         except: pass
 
         meta = {
-            "type": "config", 
-            "api_key": final_api_key, # <--- KEY SAVED HERE FOR THIS CLIENT ONLY
+            "type": "config", "api_key": final_api_key, 
             "bot_name": req.bot_name, "bot_lang": req.bot_lang, 
             "bot_status": str(req.bot_status), "biz_name": req.biz_name, 
             "biz_phone": req.biz_phone, "biz_email": req.biz_email,
@@ -365,4 +360,4 @@ async def verify_engine(req: AutoSyncRequest):
     except: return {"status": "failed"}
 
 @app.get("/")
-def health(): return {"status": "Omni-Brain v15.1 Active"}
+def health(): return {"status": "Omni-Brain v15.2 Diagnostic"}

@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 if not PINECONE_API_KEY:
     logger.error("CRITICAL: PINECONE_API_KEY is missing.")
 
-app = FastAPI(title="Omni-Brain v14.3 (Dimension Lock)", version="14.3")
+app = FastAPI(title="Omni-Brain v14.6 (Stable Core)", version="14.6")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 # --- DATABASE CONNECTION ---
@@ -40,22 +40,21 @@ def connect_db():
 
 index = connect_db()
 
-# --- AUTO-DETECT MODELS ---
+# --- SMART MODEL SELECTOR ---
 def get_optimal_models(api_key):
     """
-    Finds the best available models for the user's API Key.
+    Scans the API Key to find the best working models.
     """
     try:
         genai.configure(api_key=api_key)
-        found_embed = "models/embedding-001" # Default safe fallback (768 dim)
+        found_embed = "models/embedding-001" # Safe default
         
-        # Scan for newer models
         try:
+            # Check if key supports the newer 004 model
             for m in genai.list_models():
-                if 'embedContent' in m.supported_generation_methods:
-                    if 'text-embedding-004' in m.name:
-                        found_embed = m.name
-                        break
+                if 'text-embedding-004' in m.name:
+                    found_embed = m.name
+                    break
         except: pass
         
         return {
@@ -65,33 +64,40 @@ def get_optimal_models(api_key):
     except:
         return {"chat": "gemini-2.0-flash", "embed": "models/embedding-001"}
 
-# --- SAFE EMBEDDING FUNCTION (THE FIX) ---
+# --- FIXED EMBEDDING FUNCTION ---
 def safe_embed(model_name, text):
     """
-    Forces embedding to 768 dimensions to fit Pinecone.
+    Smartly handles dimensions based on the specific model version.
     """
     try:
-        # Try forcing 768 dimensions (Works for text-embedding-004)
-        return genai.embed_content(
-            model=model_name, 
-            content=text, 
-            output_dimensionality=768
-        )['embedding']
-    except TypeError:
-        # Fallback for models that don't support resizing (embedding-001 is natively 768)
-        return genai.embed_content(
-            model=model_name, 
-            content=text
-        )['embedding']
+        # CASE A: Newer models (004) require dimension setting
+        if "004" in model_name:
+            return genai.embed_content(
+                model=model_name, 
+                content=text, 
+                output_dimensionality=768
+            )['embedding']
+        
+        # CASE B: Older models (001) must NOT have dimension setting
+        else:
+            return genai.embed_content(
+                model=model_name, 
+                content=text
+            )['embedding']
+            
     except Exception as e:
-        logger.error(f"Embedding Failed: {e}")
-        return [0.0] * 768 # Return blank vector on crash to prevent 500 Error
+        logger.error(f"Embedding Error ({model_name}): {e}")
+        # Emergency Fallback to Universal Model
+        try:
+            return genai.embed_content(model="models/embedding-001", content=text)['embedding']
+        except:
+            return [0.0] * 768 # Return blank vector to prevent crash
 
 # --- DATA MODELS ---
 class TrainRequest(BaseModel):
     client_id: str
     url: str
-    gemini_api_key: str = "" 
+    gemini_api_key: str 
     bot_name: str = "AI Assistant"
     bot_lang: str = "English"
     timezone: str = "Auto-detect (IST)"
@@ -162,7 +168,6 @@ async def deep_scraper_engine(start_url: str, client_id: str, api_key: str, max_
     if not start_url.startswith("http"): start_url = f"https://{start_url}"
     
     models = get_optimal_models(api_key)
-    
     domain = urlparse(start_url).netloc
     visited, vectors, seen_hashes = set(), [], set()
     queue = asyncio.Queue()
@@ -204,9 +209,7 @@ async def deep_scraper_engine(start_url: str, client_id: str, api_key: str, max_
                         if h in seen_hashes: continue
                         seen_hashes.add(h)
 
-                        # USE SAFE EMBED (Forces 768)
                         emb = safe_embed(models["embed"], chunk)
-                        
                         vectors.append({
                             "id": f"neural_{uuid.uuid4()}",
                             "values": emb,
@@ -240,7 +243,6 @@ async def upload_file_engine(client_id: str, file: UploadFile = File(...)):
         chunks = [content[i:i+1200] for i in range(0, len(content), 1200)]
         vectors = []
         for i, c in enumerate(chunks):
-             # USE SAFE EMBED
              emb = safe_embed(models["embed"], c)
              vectors.append({
                  "id": f"doc_{uuid.uuid4()}",
@@ -269,6 +271,10 @@ async def saas_brain_chat(req: ChatRequest):
         api_key = conf.get('api_key', '').strip()
         if not api_key: return {"answer": "Error: Admin must configure API Key."}
         
+        # Verify Key Usage in Logs (Debug)
+        masked_key = f"{api_key[:5]}...{api_key[-3:]}"
+        logger.info(f"Using API Key: {masked_key} for client {req.client_id}")
+
         models = get_optimal_models(api_key)
 
         await asyncio.sleep(int(conf.get("delay", 1000)) / 1000)
@@ -283,7 +289,7 @@ async def saas_brain_chat(req: ChatRequest):
 
         history = get_conversation_history(req.client_id, req.session_id)
         
-        # USE SAFE EMBED
+        # Use Fixed Embedding
         emb = safe_embed(models["embed"], req.message)
 
         search = index.query(namespace=req.client_id, vector=emb, top_k=6, include_metadata=True, filter={"type": "knowledge"})
@@ -308,7 +314,10 @@ async def saas_brain_chat(req: ChatRequest):
         return {"answer": ans}
     except Exception as e:
         logger.error(f"CHAT ERROR: {e}")
-        return {"answer": f"System Error: {str(e)}"}
+        error_msg = str(e)
+        if "429" in error_msg:
+            return {"answer": "System Error: Daily message quota exceeded. Please enable billing in Google AI Studio to remove limits."}
+        return {"answer": f"System Error: {error_msg}"}
 
 # --- TRAIN ---
 @app.post("/train")
@@ -320,7 +329,7 @@ async def train_saas_engine(req: TrainRequest, bg: BackgroundTasks):
             if existing.vectors:
                 final_api_key = existing.vectors[f"config_{req.client_id}"].metadata.get("api_key")
         
-        if not final_api_key: return {"status": "error", "message": "No API Key found."}
+        if not final_api_key: return {"status": "error", "message": "No API Key provided."}
 
         try: index.delete(delete_all=True, namespace=req.client_id)
         except: pass
@@ -382,4 +391,4 @@ async def verify_engine(req: AutoSyncRequest):
     except: return {"status": "failed"}
 
 @app.get("/")
-def health(): return {"status": "Omni-Brain v14.3 Dimension Lock Active"}
+def health(): return {"status": "Omni-Brain v14.6 Stable Active"}

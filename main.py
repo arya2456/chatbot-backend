@@ -16,23 +16,17 @@ from pydantic import BaseModel
 from pinecone import Pinecone
 import google.generativeai as genai
 
-# --- 1. HARDCODED CREDENTIALS (THE SANITY CHECK) ---
-# Paste your NEW key inside the quotes below. Do not leave it empty.
-DIRECT_GEMINI_KEY = "AIzaSyAU8qJRouqn3yEvIeVVZJC_XvxOBWxpkac"
-
+# --- 1. SYSTEM CONFIGURATION ---
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
 PINECONE_INDEX_NAME = os.getenv("PINECONE_INDEX_NAME", "chatbot-index")
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Force Configuration Immediately
-if DIRECT_GEMINI_KEY == "PASTE_YOUR_NEW_KEY_HERE":
-    logger.error("⚠️ YOU FORGOT TO PASTE THE KEY IN MAIN.PY ⚠️")
-else:
-    genai.configure(api_key=DIRECT_GEMINI_KEY)
+if not PINECONE_API_KEY:
+    logger.error("CRITICAL: PINECONE_API_KEY is missing.")
 
-app = FastAPI(title="Omni-Brain v14.7 (Hardcoded Key)", version="14.7")
+app = FastAPI(title="Omni-Brain v15.1 (Production BYOK)", version="15.1")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 # --- DATABASE CONNECTION ---
@@ -46,28 +40,49 @@ def connect_db():
 
 index = connect_db()
 
-# --- SAFE EMBEDDING FUNCTION ---
-def safe_embed(text):
+# --- DYNAMIC MODEL FINDER ---
+def get_optimal_models(api_key):
     """
-    Uses the hardcoded key and the Universal Model (001).
+    Checks what models the CLIENT'S specific key allows.
     """
     try:
-        # We explicitly use the hardcoded key here to be 100% sure
-        genai.configure(api_key=DIRECT_GEMINI_KEY)
+        genai.configure(api_key=api_key)
+        found_embed = "models/embedding-001" # Default safe fallback
         
-        return genai.embed_content(
-            model="models/embedding-001", 
-            content=text
-        )['embedding']
+        try:
+            for m in genai.list_models():
+                if 'embedContent' in m.supported_generation_methods:
+                    if 'text-embedding-004' in m.name:
+                        found_embed = m.name
+                        break
+        except: pass
+        
+        return {
+            "chat": "gemini-2.0-flash", 
+            "embed": found_embed
+        }
+    except:
+        return {"chat": "gemini-2.0-flash", "embed": "models/embedding-001"}
+
+# --- SAFE EMBEDDING FUNCTION ---
+def safe_embed(model_name, text):
+    try:
+        if "004" in model_name:
+            return genai.embed_content(model=model_name, content=text, output_dimensionality=768)['embedding']
+        else:
+            return genai.embed_content(model=model_name, content=text)['embedding']
     except Exception as e:
-        logger.error(f"Embedding Failed: {e}")
-        return [0.0] * 768 # Return blank vector to prevent crash
+        logger.error(f"Embedding Error: {e}")
+        try:
+            return genai.embed_content(model="models/embedding-001", content=text)['embedding']
+        except:
+            return [0.0] * 768
 
 # --- DATA MODELS ---
 class TrainRequest(BaseModel):
     client_id: str
     url: str
-    gemini_api_key: str = "" 
+    gemini_api_key: str 
     bot_name: str = "AI Assistant"
     bot_lang: str = "English"
     timezone: str = "Auto-detect (IST)"
@@ -123,36 +138,21 @@ def get_conversation_history(client_id: str, session_id: str, limit: int = 6):
         return "\n".join([f"User: {m['metadata'].get('user','')}\nAI: {m['metadata'].get('bot','')}" for m in matches])
     except: return ""
 
-# --- HELPER: THEME ---
-async def extract_theme_color(session, url):
-    try:
-        async with session.get(url, timeout=10, ssl=False) as resp:
-            if resp.status != 200: return "#4F46E5"
-            soup = BeautifulSoup(await resp.text(), 'html.parser')
-            meta = soup.find("meta", {"name": "theme-color"})
-            return meta.get("content") if meta else "#4F46E5"
-    except: return "#4F46E5"
-
 # --- STEP 1: SCRAPER ---
 async def deep_scraper_engine(start_url: str, client_id: str, api_key: str, max_pages: int = 40):
     if not start_url.startswith("http"): start_url = f"https://{start_url}"
     
-    # Force Key Use
-    genai.configure(api_key=DIRECT_GEMINI_KEY)
-
+    models = get_optimal_models(api_key)
     domain = urlparse(start_url).netloc
     visited, vectors, seen_hashes = set(), [], set()
     queue = asyncio.Queue()
     await queue.put((start_url, 0))
 
     async with aiohttp.ClientSession() as session:
-        color = await extract_theme_color(session, start_url)
         try:
             res = index.fetch(ids=[f"config_{client_id}"], namespace=client_id)
-            if res.vectors:
-                meta = res.vectors[f"config_{client_id}"].metadata
-                meta["bot_color"] = color
-                index.upsert(vectors=[{"id": f"config_{client_id}", "values": [1.0]*768, "metadata": meta}], namespace=client_id)
+            if not res.vectors:
+                index.upsert(vectors=[{"id": f"config_{client_id}", "values": [1.0]*768, "metadata": {"bot_color": "#4F46E5"}}], namespace=client_id)
         except: pass
 
         while not queue.empty() and len(visited) < max_pages:
@@ -171,8 +171,7 @@ async def deep_scraper_engine(start_url: str, client_id: str, api_key: str, max_
                     text = soup.get_text(separator=' ', strip=True)
                     if len(text) < 200: continue
 
-                    # Chat Model: Using 2.0 Flash
-                    cleaner = genai.GenerativeModel("gemini-2.0-flash")
+                    cleaner = genai.GenerativeModel(models["chat"])
                     clean_text = await generate_answer_with_retry(cleaner, f"Extract business facts only. Remove fluff. TEXT: {text[:8000]}")
 
                     chunks = [clean_text[i:i+1500] for i in range(0, len(clean_text), 1500)]
@@ -181,7 +180,7 @@ async def deep_scraper_engine(start_url: str, client_id: str, api_key: str, max_
                         if h in seen_hashes: continue
                         seen_hashes.add(h)
 
-                        emb = safe_embed(chunk)
+                        emb = safe_embed(models["embed"], chunk)
                         vectors.append({
                             "id": f"neural_{uuid.uuid4()}",
                             "values": emb,
@@ -198,6 +197,14 @@ async def deep_scraper_engine(start_url: str, client_id: str, api_key: str, max_
 @app.post("/upload-file")
 async def upload_file_engine(client_id: str, file: UploadFile = File(...)):
     try:
+        res = index.fetch(ids=[f"config_{client_id}"], namespace=client_id)
+        if not res.vectors: return {"status": "error", "message": "Train website first."}
+        
+        api_key = res.vectors[f"config_{client_id}"].metadata.get('api_key')
+        if not api_key: return {"status": "error", "message": "API Key missing."}
+        
+        models = get_optimal_models(api_key)
+
         content = ""
         if file.content_type == "application/pdf":
             reader = pypdf.PdfReader(io.BytesIO(await file.read()))
@@ -207,7 +214,7 @@ async def upload_file_engine(client_id: str, file: UploadFile = File(...)):
         chunks = [content[i:i+1200] for i in range(0, len(content), 1200)]
         vectors = []
         for i, c in enumerate(chunks):
-             emb = safe_embed(c)
+             emb = safe_embed(models["embed"], c)
              vectors.append({
                  "id": f"doc_{uuid.uuid4()}",
                  "values": emb,
@@ -217,16 +224,13 @@ async def upload_file_engine(client_id: str, file: UploadFile = File(...)):
         return {"status": "success", "message": f"Learned from {file.filename}"}
     except Exception as e: return {"status": "error", "message": str(e)}
 
-# --- CHAT ENGINE (HARDCODED KEY) ---
+# --- CHAT ENGINE (SCALABLE BYOK) ---
 @app.post("/chat")
 async def saas_brain_chat(req: ChatRequest):
     try:
         if index is None: return {"answer": "Critical: Database Error."}
         
-        # Force Key Config
-        genai.configure(api_key=DIRECT_GEMINI_KEY)
-
-        # 1. Fetch Config
+        # 1. FETCH CLIENT CONFIG (Including Key)
         try: res = index.fetch(ids=[f"config_{req.client_id}"], namespace=req.client_id)
         except: return {"answer": "Connection Error. Retrying..."}
 
@@ -237,9 +241,16 @@ async def saas_brain_chat(req: ChatRequest):
         if str(conf.get("bot_status", "True")).lower() in ("false", "0", "off"):
             return {"answer": "This assistant is currently offline."}
 
+        # 2. EXTRACT KEY FROM DATABASE
+        api_key = conf.get('api_key', '').strip()
+        if not api_key: return {"answer": "Error: Admin must configure API Key in Dashboard."}
+        
+        # 3. DYNAMICALLY CONFIGURE FOR THIS REQUEST ONLY
+        models = get_optimal_models(api_key)
+
         await asyncio.sleep(int(conf.get("delay", 1000)) / 1000)
 
-        # 2. Lead Gating
+        # Lead Gating
         if conf.get("leads_trigger") == "Before sharing pricing" and conf.get("collect_email", True):
              if any(x in req.message.lower() for x in ["price", "cost", "how much", "fees"]):
                  dummy = [0.0]*768
@@ -247,9 +258,10 @@ async def saas_brain_chat(req: ChatRequest):
                  if not ex.get("matches"):
                      return {"answer": "I'd be happy to share pricing! Could you please share your email address first?"}
 
-        # 3. Generate
         history = get_conversation_history(req.client_id, req.session_id)
-        emb = safe_embed(req.message)
+        
+        # Embedding
+        emb = safe_embed(models["embed"], req.message)
 
         search = index.query(namespace=req.client_id, vector=emb, top_k=6, include_metadata=True, filter={"type": "knowledge"})
         ctx = "\n\n".join([m['metadata']['text'] for m in search['matches']])
@@ -262,19 +274,8 @@ async def saas_brain_chat(req: ChatRequest):
         HISTORY: {history}
         """
         
-        # Primary Model: 2.0 Flash
-        model = genai.GenerativeModel("gemini-2.0-flash")
-        
-        # Retry logic specifically for Hardcoded Key
-        try:
-            ans = model.generate_content(f"{sys_msg}\n\nUSER: {req.message}").text
-        except Exception as e:
-            if "429" in str(e):
-                # Fallback to 2.5 Flash if 2.0 is busy (often has separate quota)
-                model = genai.GenerativeModel("gemini-2.5-flash")
-                ans = model.generate_content(f"{sys_msg}\n\nUSER: {req.message}").text
-            else:
-                raise e
+        model = genai.GenerativeModel(models["chat"])
+        ans = await generate_answer_with_retry(model, f"{sys_msg}\n\nUSER: {req.message}")
 
         log_id = f"log_{req.session_id}_{uuid.uuid4()}"
         m_type = "lead" if re.search(r"[\w\.-]+@[\w\.-]+", req.message) else "chat_log"
@@ -284,19 +285,31 @@ async def saas_brain_chat(req: ChatRequest):
         return {"answer": ans}
     except Exception as e:
         logger.error(f"CHAT ERROR: {e}")
-        return {"answer": f"System Error: {str(e)}"}
+        error_msg = str(e)
+        if "429" in error_msg:
+            return {"answer": "System Error: Your API Key quota is full. Please add billing to your Google Cloud account."}
+        return {"answer": f"System Error: {error_msg}"}
 
-# --- TRAIN ---
+# --- TRAIN (SAVES KEY TO DB) ---
 @app.post("/train")
 async def train_saas_engine(req: TrainRequest, bg: BackgroundTasks):
     try:
+        final_api_key = req.gemini_api_key.strip()
+        
+        # If user didn't enter a new key, try to keep the old one
+        if not final_api_key:
+            existing = index.fetch(ids=[f"config_{req.client_id}"], namespace=req.client_id)
+            if existing.vectors:
+                final_api_key = existing.vectors[f"config_{req.client_id}"].metadata.get("api_key")
+        
+        if not final_api_key: return {"status": "error", "message": "No API Key provided."}
+
         try: index.delete(delete_all=True, namespace=req.client_id)
         except: pass
 
         meta = {
             "type": "config", 
-            # We ignore the key passed from frontend and use the hardcoded one
-            "api_key": DIRECT_GEMINI_KEY, 
+            "api_key": final_api_key, # <--- KEY SAVED HERE FOR THIS CLIENT ONLY
             "bot_name": req.bot_name, "bot_lang": req.bot_lang, 
             "bot_status": str(req.bot_status), "biz_name": req.biz_name, 
             "biz_phone": req.biz_phone, "biz_email": req.biz_email,
@@ -308,7 +321,7 @@ async def train_saas_engine(req: TrainRequest, bg: BackgroundTasks):
         }
         index.upsert(vectors=[{"id": f"config_{req.client_id}", "values": [1.0]*768, "metadata": meta}], namespace=req.client_id)
         
-        bg.add_task(deep_scraper_engine, req.url, req.client_id, DIRECT_GEMINI_KEY)
+        bg.add_task(deep_scraper_engine, req.url, req.client_id, final_api_key)
         return {"status": "success", "message": "Deep Sync Started."}
     except Exception as e: return {"status": "error", "message": str(e)}
 
@@ -352,4 +365,4 @@ async def verify_engine(req: AutoSyncRequest):
     except: return {"status": "failed"}
 
 @app.get("/")
-def health(): return {"status": "Omni-Brain v14.7 Hardcoded Key Active"}
+def health(): return {"status": "Omni-Brain v15.1 Active"}

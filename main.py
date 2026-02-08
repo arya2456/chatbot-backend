@@ -270,8 +270,8 @@ async def saas_brain_chat(req: ChatRequest):
             ans = model.generate_content(f"{sys_msg}\n\nUSER: {req.message}").text
         except Exception as e:
             if "429" in str(e):
-                # Fallback to 1.5 Flash if 2.0 is busy (often has separate quota)
-                model = genai.GenerativeModel("gemini-1.5-flash")
+                # Fallback to 2.5 Flash if 2.0 is busy (often has separate quota)
+                model = genai.GenerativeModel("gemini-2.5-flash")
                 ans = model.generate_content(f"{sys_msg}\n\nUSER: {req.message}").text
             else:
                 raise e

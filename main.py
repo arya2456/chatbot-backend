@@ -1,21 +1,18 @@
 import os
 import time
-import re
 import asyncio
-import aiohttp
 import logging
-import io
-import pypdf
 import uuid
-import hashlib
-from urllib.parse import urljoin, urlparse
+from typing import Dict
 from bs4 import BeautifulSoup
-from fastapi import FastAPI, BackgroundTasks, UploadFile, File
+import aiohttp
+from urllib.parse import urljoin, urlparse
+from fastapi import FastAPI, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from pinecone import Pinecone
-from contextlib import asynccontextmanager
 import google.generativeai as genai
+from contextlib import asynccontextmanager
 
 # --- 1. CONFIGURATION ---
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
@@ -24,16 +21,18 @@ PINECONE_INDEX_NAME = os.getenv("PINECONE_INDEX_NAME", "chatbot-index")
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# GLOBAL STATUS TRACKER (For the Progress Bar)
+CRAWL_STATUS: Dict[str, dict] = {}
+
 if not PINECONE_API_KEY:
     logger.error("CRITICAL: PINECONE_API_KEY is missing.")
 
-# --- 2. DAILY AUTO-SCHEDULER (Restored) ---
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     asyncio.create_task(daily_auto_crawler())
     yield
 
-app = FastAPI(title="Omni-Brain v21.0 (Hybrid + Advanced)", version="21.0", lifespan=lifespan)
+app = FastAPI(title="Omni-Brain v22.0 (Full SaaS)", version="22.0", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 def connect_db():
@@ -44,27 +43,44 @@ def connect_db():
 
 index = connect_db()
 
-# --- 3. DATA MODELS ---
-class ChatRequest(BaseModel):
-    message: str
-    client_id: str
-    session_id: str = "Guest"
-    api_key: str = "" # Accepts key from widget
-
+# --- 2. EXPANDED DATA MODELS (Everything form Dashboard) ---
 class TrainRequest(BaseModel):
     client_id: str
     url: str
     gemini_api_key: str 
+    # Visuals
     bot_name: str = "AI Assistant"
     bot_lang: str = "English"
     bot_personality: str = "Auto-Detect"
+    bot_color: str = "#4F46E5"
+    bot_avatar: str = ""
+    # Business Details
+    biz_name: str = ""
+    biz_phone: str = ""
+    biz_email: str = ""
+    # Functionality
+    bot_status: bool = True
+    response_delay_ms: int = 1500
+    max_conv_length: int = 50
+    fallback_msg: str = "I'm not sure. Would you like to speak to a human?"
+    # Leads & Actions
+    leads_trigger: str = "Before pricing"
+    collect_name: bool = True
+    collect_email: bool = True
+    collect_phone: bool = False
+    book_call_link: str = ""
+    whatsapp_number: str = ""
 
-# --- 4. SMART HELPERS ---
-async def daily_auto_crawler():
-    """Wakes up every 24h to re-sync data."""
-    while True:
-        await asyncio.sleep(86400) # 24 Hours
+class ChatRequest(BaseModel):
+    message: str
+    client_id: str
+    session_id: str = "Guest"
+    api_key: str = "" 
 
+class StatusRequest(BaseModel):
+    client_id: str
+
+# --- 3. SMART HELPERS ---
 def get_model(api_key):
     genai.configure(api_key=api_key)
     return genai.GenerativeModel("gemini-2.5-flash")
@@ -76,49 +92,47 @@ def safe_embed(text, api_key):
     except:
         return [0.0] * 768
 
-async def analyze_brand_style(session, text, url, api_key):
-    """Detects Brand Tone and Color."""
-    try:
-        model = get_model(api_key)
-        prompt = f"Analyze tone (Professional/Friendly/Urgent): {text[:1000]}"
-        tone = model.generate_content(prompt).text.strip()
-    except: tone = "Professional"
-    
-    color = "#4F46E5"
-    try:
-        async with session.get(url, timeout=5, ssl=False) as resp:
-            soup = BeautifulSoup(await resp.text(), 'html.parser')
-            meta = soup.find("meta", {"name": "theme-color"})
-            if meta: color = meta.get("content")
-    except: pass
-    return tone, color
+async def daily_auto_crawler():
+    while True:
+        await asyncio.sleep(86400) 
 
-# --- 5. SCRAPER ENGINE ---
+# --- 4. THE REAL SCRAPER (With Progress Updates) ---
 async def deep_scraper_engine(start_url: str, client_id: str, api_key: str):
     if not start_url.startswith("http"): start_url = f"https://{start_url}"
+    
+    # INIT STATUS
+    CRAWL_STATUS[client_id] = {"status": "scanning", "pages": 0, "progress": 5}
+    
     domain = urlparse(start_url).netloc
     visited, vectors, seen_hashes = set(), [], set()
     queue = asyncio.Queue()
     await queue.put((start_url, 0))
 
     async with aiohttp.ClientSession() as session:
-        first_page_text = ""
         while not queue.empty() and len(visited) < 30:
             url, depth = await queue.get()
             if url in visited or depth > 3: continue
             visited.add(url)
+            
+            # UPDATE PROGRESS
+            CRAWL_STATUS[client_id]["pages"] = len(visited)
+            CRAWL_STATUS[client_id]["progress"] = int((len(visited) / 30) * 90) # Up to 90%
+            
             try:
                 async with session.get(url, timeout=10, ssl=False) as resp:
                     if resp.status != 200: continue
                     soup = BeautifulSoup(await resp.text(), 'html.parser')
+                    
+                    # Discovery
                     for a in soup.find_all('a', href=True):
                         link = urljoin(url, a['href']).split('#')[0].rstrip('/')
                         if urlparse(link).netloc == domain and link not in visited:
                             await queue.put((link, depth + 1))
+                    
+                    # Processing
                     for x in soup(['script', 'style', 'nav', 'footer', 'aside']): x.decompose()
                     text = soup.get_text(separator=' ', strip=True)
                     if len(text) < 200: continue
-                    if not first_page_text: first_page_text = text
 
                     chunks = [text[i:i+1000] for i in range(0, len(text), 1000)]
                     for i, chunk in enumerate(chunks):
@@ -129,125 +143,107 @@ async def deep_scraper_engine(start_url: str, client_id: str, api_key: str):
                         emb = safe_embed(chunk, api_key)
                         vectors.append({
                             "id": f"neural_{uuid.uuid4()}", "values": emb,
-                            # FEATURE: Save URL for Citation
                             "metadata": {"text": chunk, "url": url, "type": "knowledge"} 
                         })
+                    
+                    # Batch Upload
                     if len(vectors) > 20:
                         index.upsert(vectors=vectors, namespace=client_id)
                         vectors = []
             except: continue
+        
         if vectors: index.upsert(vectors=vectors, namespace=client_id)
+        
+        # COMPLETE
+        CRAWL_STATUS[client_id] = {"status": "complete", "pages": len(visited), "progress": 100}
 
-        # Auto-Style Update
-        tone, color = await analyze_brand_style(session, first_page_text, start_url, api_key)
-        try:
-            res = index.fetch(ids=[f"config_{client_id}"], namespace=client_id)
-            if res.vectors:
-                meta = res.vectors[f"config_{client_id}"].metadata
-                if meta.get("bot_personality") == "Auto-Detect": meta["bot_personality"] = f"Use a {tone} tone."
-                if meta.get("bot_color") == "#4F46E5": meta["bot_color"] = color
-                index.upsert(vectors=[{"id": f"config_{client_id}", "values": [1.0]*768, "metadata": meta}], namespace=client_id)
-        except: pass
+# --- 5. ENDPOINTS ---
 
-# --- 6. CHAT ENGINE (HYBRID FAILOVER) ---
-@app.post("/chat")
-async def saas_brain_chat(req: ChatRequest):
-    try:
-        # STEP 1: HYBRID KEY RECOVERY
-        # If widget sends a bad key (short or empty), IGNORE it and look in DB.
-        active_key = req.api_key.strip()
-        
-        if len(active_key) < 10: 
-            logger.info(f"⚠️ Widget Key Invalid/Empty. Falling back to DB for {req.client_id}")
-            try:
-                res = index.fetch(ids=[f"config_{req.client_id}"], namespace=req.client_id)
-                if res.vectors:
-                    active_key = res.vectors[f"config_{req.client_id}"].metadata.get("api_key")
-            except: pass
-        
-        if not active_key or len(active_key) < 10:
-            return {"answer": "Configuration Error: No valid API Key found. Please update settings in Dashboard."}
-
-        # STEP 2: RETRIEVAL
-        emb = safe_embed(req.message, active_key)
-        search = index.query(namespace=req.client_id, vector=emb, top_k=4, include_metadata=True, filter={"type": "knowledge"})
-        
-        context_blocks = []
-        for m in search['matches']:
-            text = m['metadata'].get('text', '')
-            url = m['metadata'].get('url', '')
-            # Save URL for citation logic
-            context_blocks.append(f"FACT: {text} [Source: {url}]")
-        
-        context_str = "\n".join(context_blocks)
-
-        # STEP 3: GENERATE with SMART CITATION PROMPT
-        # We tell it: Only link if asked OR if it's a specific fact.
-        sys_msg = f"""
-        You are an AI assistant.
-        
-        INSTRUCTIONS:
-        1. Answer based ONLY on the Facts provided below.
-        2. SMART CITATION: If you use a specific Fact, you MAY include the [Source: URL] at the end of the sentence, but only if it adds value. 
-        3. If the user explicitly asks "Where did you find this?", you MUST provide the link.
-        
-        FACTS:
-        {context_str}
-        """
-        
-        model = get_model(active_key)
-        
-        try:
-            ans = model.generate_content(f"{sys_msg}\n\nUSER: {req.message}").text
-        except Exception as e:
-            if "400" in str(e): return {"answer": "API Error: The Google Key is invalid. Please check Dashboard."}
-            if "429" in str(e): return {"answer": "System Busy: Daily limit reached. Please try again tomorrow."}
-            return {"answer": f"Google Error: {str(e)}"}
-
-        return {"answer": ans}
-
-    except Exception as e:
-        return {"answer": f"Critical Error: {str(e)}"}
-
-# --- 7. TRAIN ---
 @app.post("/train")
 async def train_saas_engine(req: TrainRequest, bg: BackgroundTasks):
     try:
-        # Save config (This creates the Mini-Brain)
-        meta = {
-            "type": "config", 
-            "api_key": req.gemini_api_key, # Key saved here for failover
-            "bot_name": req.bot_name, 
-            "bot_personality": req.bot_personality,
-            "bot_color": "#4F46E5"
-        }
+        # 1. Save FULL Configuration to Pinecone
+        meta = req.dict()
+        meta["type"] = "config"
+        # Convert any non-string/int/float/bool to string for Pinecone compatibility
+        for k, v in meta.items():
+            if v is None: meta[k] = ""
+        
         index.upsert(vectors=[{"id": f"config_{req.client_id}", "values": [1.0]*768, "metadata": meta}], namespace=req.client_id)
         
+        # 2. Start Scraper
         bg.add_task(deep_scraper_engine, req.url, req.client_id, req.gemini_api_key)
-        return {"status": "success", "message": "Deep Sync Started."}
-    except Exception as e: return {"status": "error", "message": str(e)}
+        return {"status": "success", "message": "Configuration Saved & Crawl Started"}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
 
-# --- 8. CONFIG READER (Critical for Dashboard) ---
+@app.post("/get-crawl-status")
+async def get_crawl_status(req: StatusRequest):
+    """Returns the real-time progress of the scraper."""
+    return CRAWL_STATUS.get(req.client_id, {"status": "idle", "progress": 0})
+
 @app.post("/get-config")
 async def get_conf(req: ChatRequest):
+    """Fetches the FULL config so the dashboard can load saved settings."""
     try:
         res = index.fetch(ids=[f"config_{req.client_id}"], namespace=req.client_id)
         if res.vectors:
-            d = res.vectors[f"config_{req.client_id}"].metadata
-            return {
-                "bot_name": d.get("bot_name"), 
-                "bot_color": d.get("bot_color"),
-                "bot_avatar": d.get("bot_avatar", ""),
-                "welcome_msg": f"Hi! I'm {d.get('bot_name')}. How can I help?"
-            }
-        return {"bot_name": "Support", "bot_color": "#4F46E5"}
-    except: return {"bot_name": "Support", "bot_color": "#4F46E5"}
+            return res.vectors[f"config_{req.client_id}"].metadata
+        return {"bot_name": "AI Support", "bot_color": "#4F46E5"}
+    except: return {"bot_name": "AI Support", "bot_color": "#4F46E5"}
+
+@app.post("/chat")
+async def saas_brain_chat(req: ChatRequest):
+    try:
+        # Failover Logic
+        active_key = req.api_key.strip()
+        if len(active_key) < 10:
+            try:
+                res = index.fetch(ids=[f"config_{req.client_id}"], namespace=req.client_id)
+                if res.vectors: active_key = res.vectors[f"config_{req.client_id}"].metadata.get("gemini_api_key")
+            except: pass
+        
+        if not active_key or len(active_key) < 10:
+            return {"answer": "Error: API Key missing. Check dashboard settings."}
+
+        # Retrieve Context
+        emb = safe_embed(req.message, active_key)
+        search = index.query(namespace=req.client_id, vector=emb, top_k=4, include_metadata=True, filter={"type": "knowledge"})
+        
+        context = "\n".join([f"INFO: {m['metadata']['text']} [Source: {m['metadata']['url']}]" for m in search['matches']])
+
+        # Fetch Personality from DB
+        try:
+            res = index.fetch(ids=[f"config_{req.client_id}"], namespace=req.client_id)
+            conf = res.vectors[f"config_{req.client_id}"].metadata if res.vectors else {}
+        except: conf = {}
+
+        sys_msg = f"""
+        Identity: You are {conf.get('bot_name', 'AI Assistant')} at {conf.get('biz_name', 'our company')}.
+        Tone: {conf.get('bot_personality', 'Professional')}.
+        Facts: {context}
+        
+        Rules:
+        1. Use the Facts to answer. If facts are missing, politely say you don't know.
+        2. If the user asks for {conf.get('biz_phone', 'phone')}, give it.
+        3. If the user asks to book a call, provide: {conf.get('book_call_link', '')}
+        """
+        
+        model = get_model(active_key)
+        try:
+            ans = model.generate_content(f"{sys_msg}\n\nUSER: {req.message}").text
+            return {"answer": ans}
+        except Exception as e:
+            if "400" in str(e): return {"answer": "Error: Invalid API Key."}
+            return {"answer": "I'm having trouble connecting right now."}
+
+    except Exception as e: return {"answer": f"System Error: {str(e)}"}
 
 @app.post("/verify-install")
 async def verify_engine(req: BaseModel): return {"status": "success"}
 @app.post("/get-stats")
-def stats_engine(req: BaseModel): return {"visitors": 0} 
+def stats_engine(req: BaseModel): return {"visitors": 0, "chats": 0, "leads": 0} 
 @app.post("/get-leads")
 def leads_engine(req: BaseModel): return {"leads": []}
 @app.get("/")
-def health(): return {"status": "Omni-Brain v21.0 Active"}
+def health(): return {"status": "Omni-Brain v22.0 Active"}

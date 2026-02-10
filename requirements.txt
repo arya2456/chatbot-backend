@@ -1,13 +1,11 @@
 fastapi
 uvicorn
 pydantic
-pinecone
+pinecone-client
 google-generativeai
 aiohttp
 beautifulsoup4
-apscheduler
-python-multipart
-requests
 pypdf
 python-multipart
-httpx
+requests
+python-dotenv

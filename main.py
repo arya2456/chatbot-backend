@@ -4,7 +4,7 @@ import asyncio
 import logging
 import uuid
 import re
-import json
+import json  # <--- NEW: Added for Cognitive Brain
 from typing import Dict, List, Optional
 from datetime import datetime
 from urllib.parse import urljoin, urlparse
@@ -106,7 +106,7 @@ async def daily_auto_crawler():
     while True:
         await asyncio.sleep(86400) # Placeholder for daily logic
 
-# --- 4. COGNITIVE ENGINE (New Section) ---
+# --- 4. COGNITIVE ENGINE (NEW SECTION: INTENT & EXTRACTION) ---
 async def classify_intent_and_extract(message: str, history: str, api_key: str):
     """
     Identifies User Intent and Extracts Leads in one fast step.
@@ -159,11 +159,14 @@ def format_history_str(history_list):
     return "\n".join([f"User: {x['user']}\nBot: {x['bot']}" for x in history_list])
 
 def extract_metadata(soup):
+    """Finds phone, email, and biz name automatically."""
     meta = {}
     phone_link = soup.find('a', href=re.compile(r'^tel:'))
     if phone_link: meta['biz_phone'] = phone_link['href'].replace('tel:', '').strip()
+    
     email_link = soup.find('a', href=re.compile(r'^mailto:'))
     if email_link: meta['biz_email'] = email_link['href'].replace('mailto:', '').strip()
+    
     og_name = soup.find("meta", property="og:site_name")
     if og_name: meta['biz_name'] = og_name['content']
     return meta
@@ -250,7 +253,7 @@ async def deep_scraper_engine(start_url: str, client_id: str, api_key: str):
         except Exception as e:
             CRAWL_STATUS[client_id] = {"status": "error", "message": str(e), "progress": 0}
 
-# --- 6. CHAT ENGINE (Jarvis v26.0) ---
+# --- 6. CHAT ENGINE (UPGRADED: COGNITIVE + SMART GATES) ---
 @app.post("/chat")
 async def saas_brain_chat(req: ChatRequest):
     try:
@@ -407,7 +410,7 @@ async def upload_file(client_id: str, file: UploadFile = File(...)):
         return {"status": "success", "filename": file.filename}
     except Exception as e: return {"status": "error", "message": str(e)}
 
-# --- 9. REAL ANALYTICS (Fixes "Wrong Data") ---
+# --- 9. REAL ANALYTICS (UPGRADED: FIXES DASHBOARD DATA) ---
 @app.post("/get-analytics")
 async def analytics_engine(req: BaseModel):
     class AnalyticsReq(BaseModel):
@@ -440,7 +443,7 @@ async def stats_engine(req: BaseModel):
     """
     try:
         dummy = [0.0] * 768
-        # 1. Count Unique Visitors
+        # 1. Count Unique Visitors (Sessions)
         chat_res = index.query(namespace=req.client_id, vector=dummy, filter={"type": "chat_log"}, top_k=1000, include_metadata=True)
         unique_sessions = set([m['metadata'].get('session') for m in chat_res['matches']])
         total_chats = len(chat_res['matches'])

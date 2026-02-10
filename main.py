@@ -4,6 +4,7 @@ import asyncio
 import logging
 import uuid
 import re
+import json
 from typing import Dict, List, Optional
 from datetime import datetime
 from urllib.parse import urljoin, urlparse
@@ -39,7 +40,7 @@ async def lifespan(app: FastAPI):
     asyncio.create_task(daily_auto_crawler())
     yield
 
-app = FastAPI(title="Omni-Brain v25.1 (Smart Logic)", version="25.1", lifespan=lifespan)
+app = FastAPI(title="Omni-Brain v26.0 (Cognitive Jarvis)", version="26.0", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 def connect_db():
@@ -105,9 +106,42 @@ async def daily_auto_crawler():
     while True:
         await asyncio.sleep(86400) # Placeholder for daily logic
 
-# --- 4. MEMORY & DISCOVERY ENGINES ---
-def get_session_history_list(client_id: str, session_id: str, limit: int = 3):
-    """Returns list of last 3 message dicts for logic checking."""
+# --- 4. COGNITIVE ENGINE (New Section) ---
+async def classify_intent_and_extract(message: str, history: str, api_key: str):
+    """
+    Identifies User Intent and Extracts Leads in one fast step.
+    Returns JSON: { "intent": "BUY"|"SUPPORT"|"GENERAL", "email": "...", "name": "..." }
+    """
+    try:
+        model = get_model(api_key)
+        prompt = f"""
+        ANALYZE this message in the context of a conversation.
+        
+        HISTORY:
+        {history}
+        
+        MESSAGE: "{message}"
+        
+        TASK:
+        1. Classify INTENT: 
+           - 'BOOKING' (wants to call/book/appointment/talk to human)
+           - 'PRICE' (asking cost/rates)
+           - 'INFO' (general questions/blog/website)
+           - 'GREETING' (hi/hello)
+           - 'AGREEMENT' (yes/ok/please - implying agreement to previous bot offer)
+           - 'OTHER'
+        2. Extract ENTITIES if present (Name, Email, Phone). Return null if not found.
+        
+        OUTPUT JSON ONLY:
+        {{ "intent": "...", "name": null, "email": null, "phone": null }}
+        """
+        res = model.generate_content(prompt)
+        cleaned = res.text.replace("```json", "").replace("```", "").strip()
+        return json.loads(cleaned)
+    except:
+        return {"intent": "OTHER", "name": None, "email": None, "phone": None}
+
+def get_session_history_list(client_id: str, session_id: str, limit: int = 4):
     try:
         dummy = [0.0] * 768
         res = index.query(
@@ -125,14 +159,11 @@ def format_history_str(history_list):
     return "\n".join([f"User: {x['user']}\nBot: {x['bot']}" for x in history_list])
 
 def extract_metadata(soup):
-    """Finds phone, email, and biz name automatically."""
     meta = {}
     phone_link = soup.find('a', href=re.compile(r'^tel:'))
     if phone_link: meta['biz_phone'] = phone_link['href'].replace('tel:', '').strip()
-    
     email_link = soup.find('a', href=re.compile(r'^mailto:'))
     if email_link: meta['biz_email'] = email_link['href'].replace('mailto:', '').strip()
-    
     og_name = soup.find("meta", property="og:site_name")
     if og_name: meta['biz_name'] = og_name['content']
     return meta
@@ -219,14 +250,13 @@ async def deep_scraper_engine(start_url: str, client_id: str, api_key: str):
         except Exception as e:
             CRAWL_STATUS[client_id] = {"status": "error", "message": str(e), "progress": 0}
 
-# --- 6. CHAT ENGINE (FIXED LOGIC & LOOP BREAKER) ---
+# --- 6. CHAT ENGINE (Jarvis v26.0) ---
 @app.post("/chat")
 async def saas_brain_chat(req: ChatRequest):
     try:
-        # 1. HYBRID KEY RECOVERY
+        # 1. SETUP & KEY RECOVERY
         active_key = req.api_key.strip()
         conf = {}
-        
         try:
             res = index.fetch(ids=[f"config_{req.client_id}"], namespace=req.client_id)
             if res.vectors:
@@ -234,99 +264,87 @@ async def saas_brain_chat(req: ChatRequest):
                 if len(active_key) < 10: active_key = conf.get("gemini_api_key", "")
         except: pass
         
-        if not active_key or len(active_key) < 10:
-            return {"answer": "Configuration Error: API Key missing."}
+        if not active_key or len(active_key) < 10: return {"answer": "Error: API Key missing."}
 
-        # 2. LOAD HISTORY & LOGIC GATES
+        # 2. CONTEXT & INTENT
         history_list = get_session_history_list(req.client_id, req.session_id)
         history_str = format_history_str(history_list)
-        msg_lower = req.message.lower()
+        
+        # COGNITIVE JUMP: Classify Intent using AI
+        cognition = await classify_intent_and_extract(req.message, history_str, active_key)
+        intent = cognition.get("intent", "OTHER")
+        
+        # AUTO-CAPTURE LEADS (Natural Slot Filling)
+        if cognition.get("email") or cognition.get("phone"):
+            lead_id = f"lead_{int(time.time())}"
+            lead_meta = {
+                "type": "lead", 
+                "email": cognition.get("email"), 
+                "phone": cognition.get("phone"), 
+                "name": cognition.get("name"), 
+                "message": req.message, 
+                "date": int(time.time())
+            }
+            asyncio.create_task(log_analytics(req.client_id, lead_id, lead_meta))
+
+        # 3. LOGIC GATES (Driven by Intent)
         ans = ""
-
-        # --- LOGIC GATES START ---
-
-        # Gate A: Contextual "Yes" Trap (Fixes "Yes loop")
-        # If user says "Yes" or "Fast" AND last bot message was about "Human/Call", trigger booking info immediately.
+        
+        # Logic A: User Agrees to "Human/Call" offer
         last_bot_msg = history_list[-1]['bot'].lower() if history_list else ""
-        is_agreement = any(x in msg_lower for x in ["yes", "yeah", "sure", "ok", "please", "fast"])
-        was_offering_human = any(x in last_bot_msg for x in ["speak to a human", "connect you", "schedule a call"])
+        was_offering = any(x in last_bot_msg for x in ["speak", "connect", "schedule", "call"])
         
-        if is_agreement and was_offering_human:
-            link = conf.get("book_call_link", "")
-            phone = conf.get("biz_phone", "")
-            if link and len(link) > 3:
-                ans = f"Great! You can book a slot with us immediately here: {link}"
-            elif phone:
-                ans = f"Great! Please give us a call at {phone} and we will help you right away."
-            else:
-                ans = f"Please email us at {conf.get('biz_email', 'our support email')} and we will get back to you ASAP."
-
-        # Gate B: Direct Contact Request (Fixes "give me number")
-        elif any(x in msg_lower for x in ["number", "phone", "contact", "call me", "whatsapp"]):
-            phone = conf.get("biz_phone", "") or conf.get("whatsapp_number", "")
-            if phone:
-                ans = f"You can reach us at: {phone}"
-            else:
-                ans = f"You can contact us via email at {conf.get('biz_email', 'our website')}."
-
-        # Gate C: Direct Link/Blog Request (Fixes "give me link")
-        elif any(x in msg_lower for x in ["link", "blog", "website", "url", "page"]):
-            site_url = conf.get("url", "")
-            ans = f"You can find more information on our website: {site_url}"
-
-        # Gate D: Lead Trap (Before Pricing) - Only triggers if we haven't already answered
-        elif not ans and conf.get("leads_trigger") == "price" and any(x in msg_lower for x in ["price", "cost", "rate", "fee"]):
-            ans = "I'd be happy to share our pricing! Could you please share your **Email Address** first so I can send you the details?"
+        if intent == "AGREEMENT" and was_offering:
+             link = conf.get("book_call_link", "")
+             phone = conf.get("biz_phone", "")
+             if link: ans = f"Great! You can book a slot here: {link}"
+             elif phone: ans = f"Please give us a call at {phone}."
+             else: ans = f"Please email us at {conf.get('biz_email', 'support')}."
         
-        # Gate E: General Booking
-        elif not ans and any(x in msg_lower for x in ["book", "appointment", "schedule"]):
+        # Logic B: Intent is BOOKING
+        elif not ans and intent == "BOOKING":
             link = conf.get("book_call_link", "")
-            if link and len(link) > 3:
-                ans = f"Certainly! You can book a call with our team here: {link}"
+            if link: ans = f"Certainly! You can book a call here: {link}"
+            else: ans = f"You can contact us at {conf.get('biz_phone', 'our office')}."
 
-        # --- LOGIC GATES END ---
+        # Logic C: Intent is PRICE (Lead Trap)
+        elif not ans and intent == "PRICE" and conf.get("leads_trigger") == "price":
+            # If we don't have email yet, trigger the trap
+            if not cognition.get("email"):
+                ans = "I'd be happy to share our pricing! Could you please share your **Email Address** first so I can send you the details?"
 
-        # 3. AI GENERATION (Fallback if no gates triggered)
+        # 4. RAG GENERATION
         if not ans:
             emb = safe_embed(req.message, active_key)
             search = index.query(namespace=req.client_id, vector=emb, top_k=4, include_metadata=True, filter={"type": "knowledge"})
-            
-            context_str = "\n".join([f"FACT: {m['metadata']['text']} [Source: {m['metadata']['url']}]" for m in search['matches']])
+            context = "\n".join([f"FACT: {m['metadata']['text']} [Source: {m['metadata'].get('url','')}]" for m in search['matches']])
 
             sys_msg = f"""
             ROLE: You are {conf.get('bot_name', 'AI Assistant')} for {conf.get('biz_name', 'this company')}.
             TONE: {conf.get('bot_personality', 'Professional')}.
-            LANGUAGE: {conf.get('bot_lang', 'English')}.
+            INTENT DETECTED: {intent}
             
-            KNOWLEDGE BASE:
-            {context_str}
+            KNOWLEDGE:
+            {context}
             
-            CONVERSATION HISTORY:
+            HISTORY:
             {history_str}
             
             INSTRUCTIONS:
-            1. Answer using KNOWLEDGE and HISTORY.
-            2. If the user just said "Yes" or "Okay", look at HISTORY to see what they agreed to.
-            3. If KNOWLEDGE is missing, politely say "{conf.get('fallback_msg')}".
-            4. Keep answers concise.
+            1. Answer the user based on INTENT and KNOWLEDGE.
+            2. If INTENT is 'INFO' or 'OTHER', explain using facts.
+            3. If user provided Email/Phone, acknowledge it ("Thanks for that info...").
+            4. If KNOWLEDGE missing, say "{conf.get('fallback_msg')}".
             """
-            
             model = get_model(active_key)
-            try:
-                ans = model.generate_content(f"{sys_msg}\n\nUSER: {req.message}").text
-            except Exception as e:
-                ans = "I'm having trouble connecting right now."
+            try: ans = model.generate_content(f"{sys_msg}\n\nUSER: {req.message}").text
+            except: ans = "I'm having trouble connecting."
 
-        # 4. ANALYTICS LOGGING
+        # 5. LOGGING
         log_id = f"log_{int(time.time())}_{uuid.uuid4()}"
-        log_meta = {
-            "type": "chat_log",
-            "session": req.session_id,
-            "user_msg": req.message,
-            "bot_msg": ans,
-            "timestamp": int(time.time())
-        }
-        asyncio.create_task(log_analytics(req.client_id, log_id, log_meta))
+        asyncio.create_task(log_analytics(req.client_id, log_id, {
+            "type": "chat_log", "session": req.session_id, "user_msg": req.message, "bot_msg": ans, "timestamp": int(time.time())
+        }))
 
         return {"answer": ans}
 
@@ -344,10 +362,8 @@ async def train_saas_engine(req: TrainRequest, bg: BackgroundTasks):
         if len(final_key) < 10:
             try:
                 existing = index.fetch(ids=[f"config_{req.client_id}"], namespace=req.client_id)
-                if existing.vectors:
-                    final_key = existing.vectors[f"config_{req.client_id}"].metadata.get("gemini_api_key", "")
+                if existing.vectors: final_key = existing.vectors[f"config_{req.client_id}"].metadata.get("gemini_api_key", "")
             except: pass
-        
         if len(final_key) < 10: return {"status": "error", "message": "API Key Required"}
 
         meta = req.dict()
@@ -355,12 +371,8 @@ async def train_saas_engine(req: TrainRequest, bg: BackgroundTasks):
         meta["gemini_api_key"] = final_key
         for k, v in meta.items(): 
             if v is None: meta[k] = ""
-
         index.upsert(vectors=[{"id": f"config_{req.client_id}", "values": [1.0]*768, "metadata": meta}], namespace=req.client_id)
-        
-        if req.url:
-            bg.add_task(deep_scraper_engine, req.url, req.client_id, final_key)
-        
+        if req.url: bg.add_task(deep_scraper_engine, req.url, req.client_id, final_key)
         return {"status": "success", "message": "Settings Saved & Sync Started."}
     except Exception as e: return {"status": "error", "message": str(e)}
 
@@ -395,7 +407,7 @@ async def upload_file(client_id: str, file: UploadFile = File(...)):
         return {"status": "success", "filename": file.filename}
     except Exception as e: return {"status": "error", "message": str(e)}
 
-# --- 9. REAL ANALYTICS ---
+# --- 9. REAL ANALYTICS (Fixes "Wrong Data") ---
 @app.post("/get-analytics")
 async def analytics_engine(req: BaseModel):
     class AnalyticsReq(BaseModel):
@@ -423,7 +435,44 @@ async def analytics_engine(req: BaseModel):
 
 @app.post("/get-stats")
 async def stats_engine(req: BaseModel):
-    return {"visitors": "10+", "chats": "25+", "leads": "5+"}
+    """
+    Fetches ACTUAL metrics from Pinecone.
+    """
+    try:
+        dummy = [0.0] * 768
+        # 1. Count Unique Visitors
+        chat_res = index.query(namespace=req.client_id, vector=dummy, filter={"type": "chat_log"}, top_k=1000, include_metadata=True)
+        unique_sessions = set([m['metadata'].get('session') for m in chat_res['matches']])
+        total_chats = len(chat_res['matches'])
+        
+        # 2. Count Leads
+        lead_res = index.query(namespace=req.client_id, vector=dummy, filter={"type": "lead"}, top_k=1000, include_metadata=True)
+        total_leads = len(lead_res['matches'])
+        
+        return {
+            "visitors": len(unique_sessions),
+            "chats": total_chats,
+            "leads": total_leads
+        }
+    except:
+        return {"visitors": 0, "chats": 0, "leads": 0}
+
+@app.post("/get-leads")
+def leads_engine(req: BaseModel):
+    """Fetches ACTUAL leads from Pinecone"""
+    try:
+        dummy = [0.0] * 768
+        res = index.query(namespace=req.client_id, vector=dummy, filter={"type": "lead"}, top_k=100, include_metadata=True)
+        leads = []
+        for m in res['matches']:
+            leads.append({
+                "email": m['metadata'].get('email') or m['metadata'].get('phone') or "No Contact",
+                "message": m['metadata'].get('message', ''),
+                "date": m['metadata'].get('date', 0)
+            })
+        leads.sort(key=lambda x: x['date'], reverse=True)
+        return {"leads": leads}
+    except: return {"leads": []}
 
 @app.post("/get-crawl-status")
 async def get_crawl_status(req: StatusRequest):
@@ -439,7 +488,6 @@ async def get_conf(req: ChatRequest):
 
 @app.post("/verify-install")
 async def verify_engine(req: BaseModel): return {"status": "success"}
-@app.post("/get-leads")
-def leads_engine(req: BaseModel): return {"leads": []}
+
 @app.get("/")
-def health(): return {"status": "Omni-Brain v25.1 Active"}
+def health(): return {"status": "Omni-Brain v26.0 Active"}

@@ -39,7 +39,7 @@ async def lifespan(app: FastAPI):
     asyncio.create_task(daily_auto_crawler())
     yield
 
-app = FastAPI(title="Omni-Brain v25.0 (Final Architecture)", version="25.0", lifespan=lifespan)
+app = FastAPI(title="Omni-Brain v25.1 (Smart Logic)", version="25.1", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 def connect_db():
@@ -105,11 +105,10 @@ async def daily_auto_crawler():
     while True:
         await asyncio.sleep(86400) # Placeholder for daily logic
 
-# --- 4. MEMORY & DISCOVERY ENGINES (The Upgrade) ---
-def get_session_history(client_id: str, session_id: str, limit: int = 4):
-    """Fetches previous context so the bot knows 'Yes' refers to 'Booking'."""
+# --- 4. MEMORY & DISCOVERY ENGINES ---
+def get_session_history_list(client_id: str, session_id: str, limit: int = 3):
+    """Returns list of last 3 message dicts for logic checking."""
     try:
-        # We perform a dummy vector query filtered by session_id
         dummy = [0.0] * 768
         res = index.query(
             namespace=client_id,
@@ -118,13 +117,12 @@ def get_session_history(client_id: str, session_id: str, limit: int = 4):
             top_k=limit,
             include_metadata=True
         )
-        # Sort by time
         matches = sorted(res['matches'], key=lambda x: x['metadata'].get('timestamp', 0))
-        history = ""
-        for m in matches:
-            history += f"User: {m['metadata'].get('user_msg','')}\nBot: {m['metadata'].get('bot_msg','')}\n"
-        return history
-    except: return ""
+        return [{"user": m['metadata'].get('user_msg',''), "bot": m['metadata'].get('bot_msg','')} for m in matches]
+    except: return []
+
+def format_history_str(history_list):
+    return "\n".join([f"User: {x['user']}\nBot: {x['bot']}" for x in history_list])
 
 def extract_metadata(soup):
     """Finds phone, email, and biz name automatically."""
@@ -143,7 +141,6 @@ def extract_metadata(soup):
 async def deep_scraper_engine(start_url: str, client_id: str, api_key: str):
     if not start_url.startswith("http"): start_url = f"https://{start_url}"
     
-    # Init Status
     CRAWL_STATUS[client_id] = {"status": "scanning", "pages": 0, "progress": 0, "current_url": "Starting..."}
     
     domain = urlparse(start_url).netloc
@@ -160,7 +157,6 @@ async def deep_scraper_engine(start_url: str, client_id: str, api_key: str):
                 if url in visited or depth > 3: continue
                 visited.add(url)
                 
-                # Update Real-Time Status
                 CRAWL_STATUS[client_id].update({
                     "pages": len(visited), 
                     "progress": int((len(visited)/30)*90),
@@ -204,7 +200,6 @@ async def deep_scraper_engine(start_url: str, client_id: str, api_key: str):
             
             if vectors: index.upsert(vectors=vectors, namespace=client_id)
             
-            # Update Client Config with Discovered Data
             if discovered_meta:
                 try:
                     res = index.fetch(ids=[f"config_{client_id}"], namespace=client_id)
@@ -215,7 +210,6 @@ async def deep_scraper_engine(start_url: str, client_id: str, api_key: str):
                             current_conf['biz_phone'] = discovered_meta['biz_phone']; updated=True
                         if not current_conf.get('biz_email') and discovered_meta.get('biz_email'): 
                             current_conf['biz_email'] = discovered_meta['biz_email']; updated=True
-                        
                         if updated:
                             index.upsert(vectors=[{"id": f"config_{client_id}", "values": [1.0]*768, "metadata": current_conf}], namespace=client_id)
                 except: pass
@@ -225,7 +219,7 @@ async def deep_scraper_engine(start_url: str, client_id: str, api_key: str):
         except Exception as e:
             CRAWL_STATUS[client_id] = {"status": "error", "message": str(e), "progress": 0}
 
-# --- 6. CHAT ENGINE (With Logic Gates & Analytics) ---
+# --- 6. CHAT ENGINE (FIXED LOGIC & LOOP BREAKER) ---
 @app.post("/chat")
 async def saas_brain_chat(req: ChatRequest):
     try:
@@ -244,23 +238,55 @@ async def saas_brain_chat(req: ChatRequest):
             return {"answer": "Configuration Error: API Key missing."}
 
         # 2. LOAD HISTORY & LOGIC GATES
-        history = get_session_history(req.client_id, req.session_id)
+        history_list = get_session_history_list(req.client_id, req.session_id)
+        history_str = format_history_str(history_list)
         msg_lower = req.message.lower()
         ans = ""
 
-        # Gate A: Lead Trap (Before Pricing)
-        if conf.get("leads_trigger") == "price" and any(x in msg_lower for x in ["price", "cost", "rate", "fee"]):
+        # --- LOGIC GATES START ---
+
+        # Gate A: Contextual "Yes" Trap (Fixes "Yes loop")
+        # If user says "Yes" or "Fast" AND last bot message was about "Human/Call", trigger booking info immediately.
+        last_bot_msg = history_list[-1]['bot'].lower() if history_list else ""
+        is_agreement = any(x in msg_lower for x in ["yes", "yeah", "sure", "ok", "please", "fast"])
+        was_offering_human = any(x in last_bot_msg for x in ["speak to a human", "connect you", "schedule a call"])
+        
+        if is_agreement and was_offering_human:
+            link = conf.get("book_call_link", "")
+            phone = conf.get("biz_phone", "")
+            if link and len(link) > 3:
+                ans = f"Great! You can book a slot with us immediately here: {link}"
+            elif phone:
+                ans = f"Great! Please give us a call at {phone} and we will help you right away."
+            else:
+                ans = f"Please email us at {conf.get('biz_email', 'our support email')} and we will get back to you ASAP."
+
+        # Gate B: Direct Contact Request (Fixes "give me number")
+        elif any(x in msg_lower for x in ["number", "phone", "contact", "call me", "whatsapp"]):
+            phone = conf.get("biz_phone", "") or conf.get("whatsapp_number", "")
+            if phone:
+                ans = f"You can reach us at: {phone}"
+            else:
+                ans = f"You can contact us via email at {conf.get('biz_email', 'our website')}."
+
+        # Gate C: Direct Link/Blog Request (Fixes "give me link")
+        elif any(x in msg_lower for x in ["link", "blog", "website", "url", "page"]):
+            site_url = conf.get("url", "")
+            ans = f"You can find more information on our website: {site_url}"
+
+        # Gate D: Lead Trap (Before Pricing) - Only triggers if we haven't already answered
+        elif not ans and conf.get("leads_trigger") == "price" and any(x in msg_lower for x in ["price", "cost", "rate", "fee"]):
             ans = "I'd be happy to share our pricing! Could you please share your **Email Address** first so I can send you the details?"
         
-        # Gate B: Booking Link Force
-        elif any(x in msg_lower for x in ["book", "call", "appointment", "schedule", "human"]):
+        # Gate E: General Booking
+        elif not ans and any(x in msg_lower for x in ["book", "appointment", "schedule"]):
             link = conf.get("book_call_link", "")
             if link and len(link) > 3:
-                ans = f"Certainly! You can book a call with our team directly here: {link}"
-            else:
-                ans = f"Please contact us at {conf.get('biz_phone', 'our office')} to schedule a call."
+                ans = f"Certainly! You can book a call with our team here: {link}"
 
-        # 3. AI GENERATION (If no gates triggered)
+        # --- LOGIC GATES END ---
+
+        # 3. AI GENERATION (Fallback if no gates triggered)
         if not ans:
             emb = safe_embed(req.message, active_key)
             search = index.query(namespace=req.client_id, vector=emb, top_k=4, include_metadata=True, filter={"type": "knowledge"})
@@ -270,17 +296,19 @@ async def saas_brain_chat(req: ChatRequest):
             sys_msg = f"""
             ROLE: You are {conf.get('bot_name', 'AI Assistant')} for {conf.get('biz_name', 'this company')}.
             TONE: {conf.get('bot_personality', 'Professional')}.
+            LANGUAGE: {conf.get('bot_lang', 'English')}.
             
             KNOWLEDGE BASE:
             {context_str}
             
             CONVERSATION HISTORY:
-            {history}
+            {history_str}
             
             INSTRUCTIONS:
-            1. Answer using KNOWLEDGE and HISTORY (to understand context like "Yes please").
-            2. If KNOWLEDGE is missing, politely say "{conf.get('fallback_msg')}".
-            3. Keep answers concise.
+            1. Answer using KNOWLEDGE and HISTORY.
+            2. If the user just said "Yes" or "Okay", look at HISTORY to see what they agreed to.
+            3. If KNOWLEDGE is missing, politely say "{conf.get('fallback_msg')}".
+            4. Keep answers concise.
             """
             
             model = get_model(active_key)
@@ -289,7 +317,7 @@ async def saas_brain_chat(req: ChatRequest):
             except Exception as e:
                 ans = "I'm having trouble connecting right now."
 
-        # 4. ANALYTICS LOGGING (Persistent)
+        # 4. ANALYTICS LOGGING
         log_id = f"log_{int(time.time())}_{uuid.uuid4()}"
         log_meta = {
             "type": "chat_log",
@@ -367,25 +395,20 @@ async def upload_file(client_id: str, file: UploadFile = File(...)):
         return {"status": "success", "filename": file.filename}
     except Exception as e: return {"status": "error", "message": str(e)}
 
-# --- 9. REAL ANALYTICS (Replacing Placeholders) ---
+# --- 9. REAL ANALYTICS ---
 @app.post("/get-analytics")
 async def analytics_engine(req: BaseModel):
-    """Fetches ACTUAL chat logs from Pinecone for the dashboard."""
     class AnalyticsReq(BaseModel):
         client_id: str
-    
-    # We query for 'chat_log' type. 
-    # Note: Pinecone query is semantic, but we use a dummy vector + filter to retrieve latest.
     try:
         dummy = [0.0] * 768
         res = index.query(
             namespace=req.client_id,
             vector=dummy,
             filter={"type": "chat_log"},
-            top_k=50, # Fetch last 50 chats
+            top_k=50,
             include_metadata=True
         )
-        
         logs = []
         for m in res['matches']:
             logs.append({
@@ -394,18 +417,13 @@ async def analytics_engine(req: BaseModel):
                 "bot": m['metadata'].get('bot_msg', ''),
                 "time": m['metadata'].get('timestamp', 0)
             })
-        
-        # Sort by time desc
         logs.sort(key=lambda x: x['time'], reverse=True)
         return {"logs": logs}
     except: return {"logs": []}
 
 @app.post("/get-stats")
 async def stats_engine(req: BaseModel):
-    """Calculates counts based on fetched analytics."""
-    # In a full production app, you'd use a Counter in Redis. 
-    # For now, we estimate based on the analytics query above to keep it fast.
-    return {"visitors": "10+", "chats": "25+", "leads": "5+"} # Estimations for MVP speed
+    return {"visitors": "10+", "chats": "25+", "leads": "5+"}
 
 @app.post("/get-crawl-status")
 async def get_crawl_status(req: StatusRequest):
@@ -424,4 +442,4 @@ async def verify_engine(req: BaseModel): return {"status": "success"}
 @app.post("/get-leads")
 def leads_engine(req: BaseModel): return {"leads": []}
 @app.get("/")
-def health(): return {"status": "Omni-Brain v25.0 Active"}
+def health(): return {"status": "Omni-Brain v25.1 Active"}

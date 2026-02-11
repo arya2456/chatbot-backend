@@ -40,7 +40,7 @@ async def lifespan(app: FastAPI):
     asyncio.create_task(daily_auto_crawler())
     yield
 
-app = FastAPI(title="Omni-Brain v26.1 (Cognitive Jarvis)", version="26.1", lifespan=lifespan)
+app = FastAPI(title="Omni-Brain v26.2 (Handshake Fixed)", version="26.2", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 def connect_db():
@@ -87,8 +87,14 @@ class ChatRequest(BaseModel):
     page_url: str = ""
     api_key: str = "" 
 
+# --- FIX: UPDATED STATUS REQUEST FOR HANDSHAKE ---
 class StatusRequest(BaseModel):
     client_id: str
+    # Added these optional fields so the backend doesn't reject the widget's connection
+    message: Optional[str] = None
+    session_id: Optional[str] = None
+    api_key: Optional[str] = None
+    page_url: Optional[str] = None
 
 # --- 3. SMART HELPERS ---
 def get_model(api_key):
@@ -484,8 +490,9 @@ def leads_engine(req: BaseModel):
 async def get_crawl_status(req: StatusRequest):
     return CRAWL_STATUS.get(req.client_id, {"status": "idle", "progress": 0, "current_url": "Waiting..."})
 
+# --- 10. CONFIG ENDPOINT (FIXED FOR AVATAR LOADING) ---
 @app.post("/get-config")
-async def get_conf(req: ChatRequest):
+async def get_conf(req: StatusRequest): # <--- FIXED: Uses StatusRequest to match Widget JS
     try:
         res = index.fetch(ids=[f"config_{req.client_id}"], namespace=req.client_id)
         if res.vectors: return res.vectors[f"config_{req.client_id}"].metadata
@@ -496,4 +503,4 @@ async def get_conf(req: ChatRequest):
 async def verify_engine(req: BaseModel): return {"status": "success"}
 
 @app.get("/")
-def health(): return {"status": "Omni-Brain v26.1 Active"}
+def health(): return {"status": "Omni-Brain v26.2 Active"}

@@ -4,7 +4,7 @@ import asyncio
 import logging
 import uuid
 import re
-import json  # <--- NEW: Added for Cognitive Brain
+import json # <--- NEW: Added for Cognitive Brain
 from typing import Dict, List, Optional
 from datetime import datetime
 from urllib.parse import urljoin, urlparse
@@ -40,7 +40,7 @@ async def lifespan(app: FastAPI):
     asyncio.create_task(daily_auto_crawler())
     yield
 
-app = FastAPI(title="Omni-Brain v26.0 (Cognitive Jarvis)", version="26.0", lifespan=lifespan)
+app = FastAPI(title="Omni-Brain v26.1 (Cognitive Jarvis)", version="26.1", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 def connect_db():
@@ -106,7 +106,7 @@ async def daily_auto_crawler():
     while True:
         await asyncio.sleep(86400) # Placeholder for daily logic
 
-# --- 4. COGNITIVE ENGINE (NEW SECTION: INTENT & EXTRACTION) ---
+# --- 4. COGNITIVE ENGINE (INTENT & EXTRACTION) ---
 async def classify_intent_and_extract(message: str, history: str, api_key: str):
     """
     Identifies User Intent and Extracts Leads in one fast step.
@@ -293,22 +293,25 @@ async def saas_brain_chat(req: ChatRequest):
         # 3. LOGIC GATES (Driven by Intent)
         ans = ""
         
+        # Define Contact Info Helpers (Safe Fallback Logic)
+        link = conf.get("book_call_link", "")
+        phone = conf.get("biz_phone", "")
+        email = conf.get("biz_email", "our support team")
+
         # Logic A: User Agrees to "Human/Call" offer
         last_bot_msg = history_list[-1]['bot'].lower() if history_list else ""
         was_offering = any(x in last_bot_msg for x in ["speak", "connect", "schedule", "call"])
         
         if intent == "AGREEMENT" and was_offering:
-             link = conf.get("book_call_link", "")
-             phone = conf.get("biz_phone", "")
-             if link: ans = f"Great! You can book a slot here: {link}"
-             elif phone: ans = f"Please give us a call at {phone}."
-             else: ans = f"Please email us at {conf.get('biz_email', 'support')}."
+             if link and len(link) > 3: ans = f"Great! You can book a slot here: {link}"
+             elif phone and len(phone) > 3: ans = f"Please give us a call at {phone}."
+             else: ans = f"Please email us at {email} and we will set that up."
         
-        # Logic B: Intent is BOOKING
-        elif not ans and intent == "BOOKING":
-            link = conf.get("book_call_link", "")
-            if link: ans = f"Certainly! You can book a call here: {link}"
-            else: ans = f"You can contact us at {conf.get('biz_phone', 'our office')}."
+        # Logic B: Intent is BOOKING or URGENT
+        elif not ans and (intent == "BOOKING" or "fast" in req.message.lower()):
+            if link and len(link) > 3: ans = f"Certainly! You can book a call here: {link}"
+            elif phone and len(phone) > 3: ans = f"You can reach us immediately at {phone}."
+            else: ans = f"We'd love to connect. Please contact us via email at {email}."
 
         # Logic C: Intent is PRICE (Lead Trap)
         elif not ans and intent == "PRICE" and conf.get("leads_trigger") == "price":
@@ -439,17 +442,17 @@ async def analytics_engine(req: BaseModel):
 @app.post("/get-stats")
 async def stats_engine(req: BaseModel):
     """
-    Fetches ACTUAL metrics from Pinecone.
+    Fetches ACTUAL metrics from Pinecone (Persistent).
     """
     try:
         dummy = [0.0] * 768
         # 1. Count Unique Visitors (Sessions)
-        chat_res = index.query(namespace=req.client_id, vector=dummy, filter={"type": "chat_log"}, top_k=1000, include_metadata=True)
+        chat_res = index.query(namespace=req.client_id, vector=dummy, filter={"type": "chat_log"}, top_k=10000, include_metadata=True)
         unique_sessions = set([m['metadata'].get('session') for m in chat_res['matches']])
         total_chats = len(chat_res['matches'])
         
         # 2. Count Leads
-        lead_res = index.query(namespace=req.client_id, vector=dummy, filter={"type": "lead"}, top_k=1000, include_metadata=True)
+        lead_res = index.query(namespace=req.client_id, vector=dummy, filter={"type": "lead"}, top_k=10000, include_metadata=True)
         total_leads = len(lead_res['matches'])
         
         return {
@@ -493,4 +496,4 @@ async def get_conf(req: ChatRequest):
 async def verify_engine(req: BaseModel): return {"status": "success"}
 
 @app.get("/")
-def health(): return {"status": "Omni-Brain v26.0 Active"}
+def health(): return {"status": "Omni-Brain v26.1 Active"}

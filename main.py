@@ -41,7 +41,7 @@ async def lifespan(app: FastAPI):
     asyncio.create_task(daily_auto_crawler())
     yield
 
-app = FastAPI(title="Omni-Brain v26.4 (Production Stable)", version="26.4", lifespan=lifespan)
+app = FastAPI(title="Omni-Brain v26.5 (Production Fix)", version="26.5", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 def connect_db():
@@ -93,9 +93,9 @@ class ChatRequest(BaseModel):
     api_key: str = "" 
 
 # --- STATUS REQUEST (Universal Key for Dashboard & Widget Handshakes) ---
+# This fixes the 422 Error by accepting optional fields
 class StatusRequest(BaseModel):
     client_id: str
-    # Added these optional fields so the backend doesn't reject the widget's connection
     message: Optional[str] = None
     session_id: Optional[str] = None
     api_key: Optional[str] = None
@@ -119,32 +119,16 @@ async def daily_auto_crawler():
 
 # --- 4. COGNITIVE ENGINE (INTENT & EXTRACTION) ---
 async def classify_intent_and_extract(message: str, history: str, api_key: str):
-    """
-    Identifies User Intent and Extracts Leads in one fast step.
-    Returns JSON: { "intent": "BUY"|"SUPPORT"|"GENERAL", "email": "...", "name": "..." }
-    """
     try:
         model = get_model(api_key)
         prompt = f"""
         ANALYZE this message in the context of a conversation.
-        
-        HISTORY:
-        {history}
-        
+        HISTORY: {history}
         MESSAGE: "{message}"
-        
         TASK:
-        1. Classify INTENT: 
-           - 'BOOKING' (wants to call/book/appointment/talk to human)
-           - 'PRICE' (asking cost/rates)
-           - 'INFO' (general questions/blog/website)
-           - 'GREETING' (hi/hello)
-           - 'AGREEMENT' (yes/ok/please - implying agreement to previous bot offer)
-           - 'OTHER'
-        2. Extract ENTITIES if present (Name, Email, Phone). Return null if not found.
-        
-        OUTPUT JSON ONLY:
-        {{ "intent": "...", "name": null, "email": null, "phone": null }}
+        1. Classify INTENT: 'BOOKING', 'PRICE', 'INFO', 'GREETING', 'AGREEMENT', 'OTHER'
+        2. Extract ENTITIES (Name, Email, Phone). Return null if not found.
+        OUTPUT JSON ONLY: {{ "intent": "...", "name": null, "email": null, "phone": null }}
         """
         res = model.generate_content(prompt)
         cleaned = res.text.replace("```json", "").replace("```", "").strip()
@@ -170,14 +154,11 @@ def format_history_str(history_list):
     return "\n".join([f"User: {x['user']}\nBot: {x['bot']}" for x in history_list])
 
 def extract_metadata(soup):
-    """Finds phone, email, and biz name automatically."""
     meta = {}
     phone_link = soup.find('a', href=re.compile(r'^tel:'))
     if phone_link: meta['biz_phone'] = phone_link['href'].replace('tel:', '').strip()
-    
     email_link = soup.find('a', href=re.compile(r'^mailto:'))
     if email_link: meta['biz_email'] = email_link['href'].replace('mailto:', '').strip()
-    
     og_name = soup.find("meta", property="og:site_name")
     if og_name: meta['biz_name'] = og_name['content']
     return meta
@@ -187,12 +168,10 @@ async def deep_scraper_engine(start_url: str, client_id: str, api_key: str):
     if not start_url.startswith("http"): start_url = f"https://{start_url}"
     
     CRAWL_STATUS[client_id] = {"status": "scanning", "pages": 0, "progress": 0, "current_url": "Starting..."}
-    
     domain = urlparse(start_url).netloc
     visited, vectors, seen_hashes = set(), [], set()
     queue = asyncio.Queue()
     await queue.put((start_url, 0))
-    
     discovered_meta = {} 
 
     async with aiohttp.ClientSession() as session:
@@ -213,9 +192,7 @@ async def deep_scraper_engine(start_url: str, client_id: str, api_key: str):
                         if resp.status != 200: continue
                         text_content = await resp.text()
                         soup = BeautifulSoup(text_content, 'html.parser')
-                        
-                        if len(visited) == 1:
-                            discovered_meta = extract_metadata(soup)
+                        if len(visited) == 1: discovered_meta = extract_metadata(soup)
 
                         for a in soup.find_all('a', href=True):
                             link = urljoin(url, a['href']).split('#')[0].rstrip('/')
@@ -231,7 +208,6 @@ async def deep_scraper_engine(start_url: str, client_id: str, api_key: str):
                             h = hashlib.sha256(chunk.encode("utf-8")).hexdigest()
                             if h in seen_hashes: continue
                             seen_hashes.add(h)
-                            
                             emb = safe_embed(chunk, api_key)
                             vectors.append({
                                 "id": f"doc_{uuid.uuid4()}", "values": emb,
@@ -260,15 +236,13 @@ async def deep_scraper_engine(start_url: str, client_id: str, api_key: str):
                 except: pass
 
             CRAWL_STATUS[client_id] = {"status": "complete", "pages": len(visited), "progress": 100, "current_url": "Done"}
-            
         except Exception as e:
             CRAWL_STATUS[client_id] = {"status": "error", "message": str(e), "progress": 0}
 
-# --- 6. CHAT ENGINE (UPGRADED: COGNITIVE + SMART GATES) ---
+# --- 6. CHAT ENGINE ---
 @app.post("/chat")
 async def saas_brain_chat(req: ChatRequest):
     try:
-        # 1. SETUP & KEY RECOVERY
         active_key = req.api_key.strip()
         conf = {}
         try:
@@ -280,36 +254,23 @@ async def saas_brain_chat(req: ChatRequest):
         
         if not active_key or len(active_key) < 10: return {"answer": "Error: API Key missing."}
 
-        # 2. CONTEXT & INTENT
         history_list = get_session_history_list(req.client_id, req.session_id)
         history_str = format_history_str(history_list)
-        
-        # COGNITIVE JUMP: Classify Intent using AI
         cognition = await classify_intent_and_extract(req.message, history_str, active_key)
         intent = cognition.get("intent", "OTHER")
         
-        # AUTO-CAPTURE LEADS (Natural Slot Filling)
         if cognition.get("email") or cognition.get("phone"):
             lead_id = f"lead_{int(time.time())}"
             lead_meta = {
-                "type": "lead", 
-                "email": cognition.get("email"), 
-                "phone": cognition.get("phone"), 
-                "name": cognition.get("name"), 
-                "message": req.message, 
-                "date": int(time.time())
+                "type": "lead", "email": cognition.get("email"), "phone": cognition.get("phone"), 
+                "name": cognition.get("name"), "message": req.message, "date": int(time.time())
             }
             asyncio.create_task(log_analytics(req.client_id, lead_id, lead_meta))
 
-        # 3. LOGIC GATES (Driven by Intent)
         ans = ""
-        
-        # Define Contact Info Helpers (Safe Fallback Logic)
         link = conf.get("book_call_link", "")
         phone = conf.get("biz_phone", "")
         email = conf.get("biz_email", "our support team")
-
-        # Logic A: User Agrees to "Human/Call" offer
         last_bot_msg = history_list[-1]['bot'].lower() if history_list else ""
         was_offering = any(x in last_bot_msg for x in ["speak", "connect", "schedule", "call"])
         
@@ -317,20 +278,14 @@ async def saas_brain_chat(req: ChatRequest):
              if link and len(link) > 3: ans = f"Great! You can book a slot here: {link}"
              elif phone and len(phone) > 3: ans = f"Please give us a call at {phone}."
              else: ans = f"Please email us at {email} and we will set that up."
-        
-        # Logic B: Intent is BOOKING or URGENT
         elif not ans and (intent == "BOOKING" or "fast" in req.message.lower()):
             if link and len(link) > 3: ans = f"Certainly! You can book a call here: {link}"
             elif phone and len(phone) > 3: ans = f"You can reach us immediately at {phone}."
             else: ans = f"We'd love to connect. Please contact us via email at {email}."
-
-        # Logic C: Intent is PRICE (Lead Trap)
         elif not ans and intent == "PRICE" and conf.get("leads_trigger") == "price":
-            # If we don't have email yet, trigger the trap
             if not cognition.get("email"):
                 ans = "I'd be happy to share our pricing! Could you please share your **Email Address** first so I can send you the details?"
 
-        # 4. RAG GENERATION
         if not ans:
             emb = safe_embed(req.message, active_key)
             search = index.query(namespace=req.client_id, vector=emb, top_k=4, include_metadata=True, filter={"type": "knowledge"})
@@ -341,38 +296,26 @@ async def saas_brain_chat(req: ChatRequest):
             TONE: {conf.get('bot_personality', 'Professional')}.
             LANGUAGE INSTRUCTION: You MUST answer in {conf.get('bot_lang', 'English')}.
             INTENT DETECTED: {intent}
-            
-            KNOWLEDGE:
-            {context}
-            
-            HISTORY:
-            {history_str}
-            
-            INSTRUCTIONS:
-            1. Answer the user based on INTENT and KNOWLEDGE.
-            2. If INTENT is 'INFO' or 'OTHER', explain using facts.
-            3. If user provided Email/Phone, acknowledge it ("Thanks for that info...").
-            4. If KNOWLEDGE missing, say "{conf.get('fallback_msg')}".
+            KNOWLEDGE: {context}
+            HISTORY: {history_str}
+            INSTRUCTIONS: 1. Answer based on KNOWLEDGE. 2. If user provided Email, acknowledge it. 3. If KNOWLEDGE missing, say "{conf.get('fallback_msg')}".
             """
             model = get_model(active_key)
             try: ans = model.generate_content(f"{sys_msg}\n\nUSER: {req.message}").text
             except: ans = "I'm having trouble connecting."
 
-        # 5. LOGGING
         log_id = f"log_{int(time.time())}_{uuid.uuid4()}"
         asyncio.create_task(log_analytics(req.client_id, log_id, {
             "type": "chat_log", "session": req.session_id, "user_msg": req.message, "bot_msg": ans, "timestamp": int(time.time())
         }))
-
         return {"answer": ans}
-
     except Exception as e: return {"answer": f"System Error: {str(e)}"}
 
 async def log_analytics(ns, id, meta):
     try: index.upsert(vectors=[{"id": id, "values": [0.1]*768, "metadata": meta}], namespace=ns)
     except: pass
 
-# --- 7. TRAIN ENDPOINT (Smart Save) ---
+# --- 7. TRAIN ENDPOINT ---
 @app.post("/train")
 async def train_saas_engine(req: TrainRequest, bg: BackgroundTasks):
     try:
@@ -394,7 +337,7 @@ async def train_saas_engine(req: TrainRequest, bg: BackgroundTasks):
         return {"status": "success", "message": "Settings Saved & Sync Started."}
     except Exception as e: return {"status": "error", "message": str(e)}
 
-# --- 8. PDF UPLOAD (Restored Feature) ---
+# --- 8. PDF UPLOAD ---
 @app.post("/upload-file")
 async def upload_file(client_id: str, file: UploadFile = File(...)):
     try:
@@ -404,30 +347,22 @@ async def upload_file(client_id: str, file: UploadFile = File(...)):
 
         content = await file.read()
         text = ""
-        
         if file.filename.endswith(".pdf"):
             reader = pypdf.PdfReader(io.BytesIO(content))
             for page in reader.pages: text += page.extract_text() + "\n"
-        else:
-            text = content.decode("utf-8")
-
+        else: text = content.decode("utf-8")
         chunks = [text[i:i+1000] for i in range(0, len(text), 1000)]
         vectors = []
         for chunk in chunks:
             emb = safe_embed(chunk, api_key)
-            vectors.append({
-                "id": f"file_{uuid.uuid4()}", 
-                "values": emb,
-                "metadata": {"text": chunk, "url": f"File: {file.filename}", "type": "knowledge"}
-            })
-        
+            vectors.append({"id": f"file_{uuid.uuid4()}", "values": emb, "metadata": {"text": chunk, "url": f"File: {file.filename}", "type": "knowledge"}})
         if vectors: index.upsert(vectors=vectors, namespace=client_id)
         return {"status": "success", "filename": file.filename}
     except Exception as e: return {"status": "error", "message": str(e)}
 
-# --- 9. REAL ANALYTICS (FIXED: Accepts StatusRequest properly) ---
+# --- 9. REAL ANALYTICS (FIXED: Accepts StatusRequest) ---
 @app.post("/get-analytics")
-async def analytics_engine(req: StatusRequest): # <--- FIXED
+async def analytics_engine(req: StatusRequest): 
     try:
         dummy = [0.0] * 768
         res = index.query(
@@ -450,32 +385,17 @@ async def analytics_engine(req: StatusRequest): # <--- FIXED
     except: return {"logs": []}
 
 @app.post("/get-stats")
-async def stats_engine(req: StatusRequest): # <--- FIXED
-    """
-    Fetches ACTUAL metrics from Pinecone (Persistent).
-    """
+async def stats_engine(req: StatusRequest): 
     try:
         dummy = [0.0] * 768
-        # 1. Count Unique Visitors (Sessions)
         chat_res = index.query(namespace=req.client_id, vector=dummy, filter={"type": "chat_log"}, top_k=10000, include_metadata=True)
         unique_sessions = set([m['metadata'].get('session') for m in chat_res['matches']])
-        total_chats = len(chat_res['matches'])
-        
-        # 2. Count Leads
         lead_res = index.query(namespace=req.client_id, vector=dummy, filter={"type": "lead"}, top_k=10000, include_metadata=True)
-        total_leads = len(lead_res['matches'])
-        
-        return {
-            "visitors": len(unique_sessions),
-            "chats": total_chats,
-            "leads": total_leads
-        }
-    except:
-        return {"visitors": 0, "chats": 0, "leads": 0}
+        return {"visitors": len(unique_sessions), "chats": len(chat_res['matches']), "leads": len(lead_res['matches'])}
+    except: return {"visitors": 0, "chats": 0, "leads": 0}
 
 @app.post("/get-leads")
-def leads_engine(req: StatusRequest): # <--- FIXED
-    """Fetches ACTUAL leads from Pinecone"""
+def leads_engine(req: StatusRequest): 
     try:
         dummy = [0.0] * 768
         res = index.query(namespace=req.client_id, vector=dummy, filter={"type": "lead"}, top_k=100, include_metadata=True)
@@ -496,7 +416,7 @@ async def get_crawl_status(req: StatusRequest):
 
 # --- 10. CONFIG ENDPOINT (FIXED FOR AVATAR LOADING) ---
 @app.post("/get-config")
-async def get_conf(req: StatusRequest): # <--- FIXED
+async def get_conf(req: StatusRequest): 
     try:
         res = index.fetch(ids=[f"config_{req.client_id}"], namespace=req.client_id)
         if res.vectors: return res.vectors[f"config_{req.client_id}"].metadata
@@ -507,4 +427,4 @@ async def get_conf(req: StatusRequest): # <--- FIXED
 async def verify_engine(req: BaseModel): return {"status": "success"}
 
 @app.get("/")
-def health(): return {"status": "Omni-Brain v26.4 Active"}
+def health(): return {"status": "Omni-Brain v26.5 Active"}

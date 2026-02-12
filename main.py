@@ -4,7 +4,7 @@ import asyncio
 import logging
 import uuid
 import re
-import json # <--- NEW: Added for Cognitive Brain
+import json 
 from typing import Dict, List, Optional
 from datetime import datetime
 from urllib.parse import urljoin, urlparse
@@ -40,7 +40,7 @@ async def lifespan(app: FastAPI):
     asyncio.create_task(daily_auto_crawler())
     yield
 
-app = FastAPI(title="Omni-Brain v26.2 (Handshake Fixed)", version="26.2", lifespan=lifespan)
+app = FastAPI(title="Omni-Brain v26.3 (Final Dashboard Fix)", version="26.3", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 def connect_db():
@@ -87,7 +87,7 @@ class ChatRequest(BaseModel):
     page_url: str = ""
     api_key: str = "" 
 
-# --- FIX: UPDATED STATUS REQUEST FOR HANDSHAKE ---
+# --- STATUS REQUEST (Universal Key for Dashboard & Widget Handshakes) ---
 class StatusRequest(BaseModel):
     client_id: str
     # Added these optional fields so the backend doesn't reject the widget's connection
@@ -419,11 +419,9 @@ async def upload_file(client_id: str, file: UploadFile = File(...)):
         return {"status": "success", "filename": file.filename}
     except Exception as e: return {"status": "error", "message": str(e)}
 
-# --- 9. REAL ANALYTICS (UPGRADED: FIXES DASHBOARD DATA) ---
+# --- 9. REAL ANALYTICS (FIXED: Accepts StatusRequest properly) ---
 @app.post("/get-analytics")
-async def analytics_engine(req: BaseModel):
-    class AnalyticsReq(BaseModel):
-        client_id: str
+async def analytics_engine(req: StatusRequest): # <--- FIXED
     try:
         dummy = [0.0] * 768
         res = index.query(
@@ -446,7 +444,7 @@ async def analytics_engine(req: BaseModel):
     except: return {"logs": []}
 
 @app.post("/get-stats")
-async def stats_engine(req: BaseModel):
+async def stats_engine(req: StatusRequest): # <--- FIXED
     """
     Fetches ACTUAL metrics from Pinecone (Persistent).
     """
@@ -470,7 +468,7 @@ async def stats_engine(req: BaseModel):
         return {"visitors": 0, "chats": 0, "leads": 0}
 
 @app.post("/get-leads")
-def leads_engine(req: BaseModel):
+def leads_engine(req: StatusRequest): # <--- FIXED
     """Fetches ACTUAL leads from Pinecone"""
     try:
         dummy = [0.0] * 768
@@ -492,7 +490,7 @@ async def get_crawl_status(req: StatusRequest):
 
 # --- 10. CONFIG ENDPOINT (FIXED FOR AVATAR LOADING) ---
 @app.post("/get-config")
-async def get_conf(req: StatusRequest): # <--- FIXED: Uses StatusRequest to match Widget JS
+async def get_conf(req: StatusRequest): # <--- FIXED
     try:
         res = index.fetch(ids=[f"config_{req.client_id}"], namespace=req.client_id)
         if res.vectors: return res.vectors[f"config_{req.client_id}"].metadata
@@ -503,4 +501,4 @@ async def get_conf(req: StatusRequest): # <--- FIXED: Uses StatusRequest to matc
 async def verify_engine(req: BaseModel): return {"status": "success"}
 
 @app.get("/")
-def health(): return {"status": "Omni-Brain v26.2 Active"}
+def health(): return {"status": "Omni-Brain v26.3 Active"}

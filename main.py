@@ -10,18 +10,17 @@ import aiohttp, pypdf
 import google.generativeai as genai
 from contextlib import asynccontextmanager
 
-# --- 1. CONFIGURATION ---
+# --- 1. CONFIG ---
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
 PINECONE_INDEX_NAME = os.getenv("PINECONE_INDEX_NAME", "chatbot-index")
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-CRAWL_STATUS: Dict[str, dict] = {}
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     yield
 
-app = FastAPI(title="Omni-Brain v27.1 (Gemini 2.0 Stable)", lifespan=lifespan)
+app = FastAPI(title="Omni-Brain v27.2", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 def connect_db():
@@ -31,14 +30,10 @@ def connect_db():
     except: return None
 
 index = connect_db()
-if index is None:
-    logger.error("CRITICAL: Pinecone connection failed.")
 
-# --- 2. DATA MODELS ---
+# --- 2. MODELS ---
 class TrainRequest(BaseModel):
-    client_id: str
-    url: str
-    gemini_api_key: str = ""
+    client_id: str; url: str; gemini_api_key: str = ""
     bot_name: str = "AI Assistant"; bot_lang: str = "English"; bot_personality: str = "Professional"
     bot_color: str = "#4F46E5"; bot_avatar: str = ""; biz_name: str = ""; biz_phone: str = ""; biz_email: str = ""
     leads_trigger: str = "price"; collect_name: bool = True; collect_email: bool = True
@@ -53,18 +48,18 @@ class StatusRequest(BaseModel):
     client_id: str; message: Optional[str] = None; session_id: Optional[str] = None
     api_key: Optional[str] = None; page_url: Optional[str] = None
 
-# --- 3. CORE HELPERS ---
+# --- 3. HELPERS ---
 def get_model(api_key):
     genai.configure(api_key=api_key)
-    # Using 'gemini-2.5-flash' as it's the current working model for your setup
-    return genai.GenerativeModel("gemini-2.5-flash")
+    # Using the specific version that works for your environment
+    return genai.GenerativeModel("gemini-2.0-flash")
 
 def safe_embed(text, api_key):
     genai.configure(api_key=api_key)
     try: return genai.embed_content(model="models/embedding-001", content=text)['embedding']
     except: return [0.0] * 768
 
-# --- 4. ENGINE ENDPOINTS ---
+# --- 4. ENGINE ---
 @app.post("/chat")
 async def saas_brain_chat(req: ChatRequest):
     try:
@@ -77,7 +72,7 @@ async def saas_brain_chat(req: ChatRequest):
         search = index.query(namespace=req.client_id, vector=emb, top_k=3, include_metadata=True, filter={"type": "knowledge"})
         context = "\n".join([m['metadata']['text'] for m in search['matches']])
         
-        sys_msg = f"Role: {conf.get('bot_name')}. Language: {conf.get('bot_lang')}. Context: {context}. User Message: {req.message}"
+        sys_msg = f"Role: {conf.get('bot_name')}. Language: {conf.get('bot_lang')}. Context: {context}. User: {req.message}"
         ans = get_model(active_key).generate_content(sys_msg).text
         
         log_meta = {"type": "chat_log", "session": req.session_id, "user_msg": req.message, "bot_msg": ans, "timestamp": int(time.time())}
@@ -87,24 +82,29 @@ async def saas_brain_chat(req: ChatRequest):
 
 @app.post("/get-config")
 async def get_conf(req: StatusRequest):
-    res = index.fetch(ids=[f"config_{req.client_id}"], namespace=req.client_id)
-    if res.vectors:
-        return res.vectors[f"config_{req.client_id}"].metadata
-    return {"bot_name": "Support", "bot_color": "#4F46E5"}
+    try:
+        res = index.fetch(ids=[f"config_{req.client_id}"], namespace=req.client_id)
+        if res.vectors: return res.vectors[f"config_{req.client_id}"].metadata
+        return {"bot_name": "Support", "bot_color": "#4F46E5"}
+    except: return {"bot_name": "Support", "bot_color": "#4F46E5"}
 
 @app.post("/get-stats")
 async def stats_engine(req: StatusRequest):
-    # Fixed analytics fetching to prevent resets
     chat_res = index.query(namespace=req.client_id, vector=[0.0]*768, filter={"type": "chat_log"}, top_k=10000, include_metadata=True)
     sessions = set([m['metadata'].get('session') for m in chat_res['matches']])
     lead_res = index.query(namespace=req.client_id, vector=[0.0]*768, filter={"type": "lead"}, top_k=10000)
     return {"visitors": len(sessions), "chats": len(chat_res['matches']), "leads": len(lead_res['matches'])}
 
+@app.post("/get-leads")
+async def leads_engine(req: StatusRequest):
+    res = index.query(namespace=req.client_id, vector=[0.0]*768, filter={"type": "lead"}, top_k=100, include_metadata=True)
+    return {"leads": [m['metadata'] for m in res['matches']]}
+
 @app.post("/train")
 async def train_saas_engine(req: TrainRequest):
     meta = req.dict(); meta["type"] = "config"
     index.upsert(vectors=[{"id": f"config_{req.client_id}", "values": [1.0]*768, "metadata": meta}], namespace=req.client_id)
-    return {"status": "success", "message": "Brain trained and saved."}
+    return {"status": "success"}
 
 @app.get("/")
-def health(): return {"status": "Omni-Brain v27.1 Active"}
+def health(): return {"status": "Omni-Brain v27.2 Active"}

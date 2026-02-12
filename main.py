@@ -5,6 +5,7 @@ import logging
 import uuid
 import re
 import json 
+import hashlib # <--- NEW: Added to prevent Crawler Crash
 from typing import Dict, List, Optional
 from datetime import datetime
 from urllib.parse import urljoin, urlparse
@@ -40,7 +41,7 @@ async def lifespan(app: FastAPI):
     asyncio.create_task(daily_auto_crawler())
     yield
 
-app = FastAPI(title="Omni-Brain v26.3 (Final Dashboard Fix)", version="26.3", lifespan=lifespan)
+app = FastAPI(title="Omni-Brain v26.4 (Production Stable)", version="26.4", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 def connect_db():
@@ -50,6 +51,10 @@ def connect_db():
     except: return None
 
 index = connect_db()
+
+# --- SAFETY CHECK: Ensure Database is Connected ---
+if index is None:
+    logger.error("CRITICAL: Pinecone Index Connection Failed. Check API Key.")
 
 # --- 2. DATA MODELS ---
 class TrainRequest(BaseModel):
@@ -334,6 +339,7 @@ async def saas_brain_chat(req: ChatRequest):
             sys_msg = f"""
             ROLE: You are {conf.get('bot_name', 'AI Assistant')} for {conf.get('biz_name', 'this company')}.
             TONE: {conf.get('bot_personality', 'Professional')}.
+            LANGUAGE INSTRUCTION: You MUST answer in {conf.get('bot_lang', 'English')}.
             INTENT DETECTED: {intent}
             
             KNOWLEDGE:
@@ -501,4 +507,4 @@ async def get_conf(req: StatusRequest): # <--- FIXED
 async def verify_engine(req: BaseModel): return {"status": "success"}
 
 @app.get("/")
-def health(): return {"status": "Omni-Brain v26.3 Active"}
+def health(): return {"status": "Omni-Brain v26.4 Active"}

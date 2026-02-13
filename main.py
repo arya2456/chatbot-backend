@@ -13,6 +13,9 @@ from contextlib import asynccontextmanager
 # --- 1. CONFIG ---
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
 PINECONE_INDEX_NAME = os.getenv("PINECONE_INDEX_NAME", "chatbot-index")
+# This points the AI to your new MySQL Brain!
+PHP_DASHBOARD_URL = "https://dashboard.fcmedia.in/api.php" 
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -51,8 +54,7 @@ class StatusRequest(BaseModel):
 # --- 3. HELPERS ---
 def get_model(api_key):
     genai.configure(api_key=api_key)
-    # Using the specific version that works for your environment
-    return genai.GenerativeModel("gemini-2.0-flash")
+    return genai.GenerativeModel("gemini-2.5-flash")
 
 def safe_embed(text, api_key):
     genai.configure(api_key=api_key)
@@ -63,6 +65,7 @@ def safe_embed(text, api_key):
 @app.post("/chat")
 async def saas_brain_chat(req: ChatRequest):
     try:
+        # 1. Get Config & Context
         res = index.fetch(ids=[f"config_{req.client_id}"], namespace=req.client_id)
         conf = res.vectors[f"config_{req.client_id}"].metadata if res.vectors else {}
         active_key = req.api_key if len(req.api_key) > 10 else conf.get("gemini_api_key", "")
@@ -72,13 +75,47 @@ async def saas_brain_chat(req: ChatRequest):
         search = index.query(namespace=req.client_id, vector=emb, top_k=3, include_metadata=True, filter={"type": "knowledge"})
         context = "\n".join([m['metadata']['text'] for m in search['matches']])
         
+        # 2. Generate AI Answer
         sys_msg = f"Role: {conf.get('bot_name')}. Language: {conf.get('bot_lang')}. Context: {context}. User: {req.message}"
         ans = get_model(active_key).generate_content(sys_msg).text
         
+        # 3. Save to Pinecone (for AI context memory)
         log_meta = {"type": "chat_log", "session": req.session_id, "user_msg": req.message, "bot_msg": ans, "timestamp": int(time.time())}
         index.upsert(vectors=[{"id": f"log_{uuid.uuid4()}", "values": [0.1]*768, "metadata": log_meta}], namespace=req.client_id)
+        
+        # 4. PUSH TO MYSQL BRAIN (For Dashboard Analytics)
+        try:
+            payload = {
+                "client_id": req.client_id,
+                "session_id": req.session_id,
+                "user_msg": req.message,
+                "bot_msg": ans
+            }
+            async with aiohttp.ClientSession() as session:
+                await session.post(f"{PHP_DASHBOARD_URL}?action=save_chat", json=payload)
+        except Exception as db_err:
+            logger.error(f"Failed to sync to MySQL: {db_err}")
+
         return {"answer": ans}
     except Exception as e: return {"answer": f"System error: {str(e)}"}
+
+# --- THE NEW LEAD PUSHER ---
+@app.post("/capture-lead")
+async def capture_lead(req: dict):
+    # If the widget sends leads here, immediately push them to the MySQL database
+    try:
+        async with aiohttp.ClientSession() as session:
+            await session.post(f"{PHP_DASHBOARD_URL}?action=save_lead", json=req)
+        
+        # Optional: Save a backup to Pinecone just in case
+        log_meta = req
+        log_meta["type"] = "lead"
+        log_meta["timestamp"] = int(time.time())
+        index.upsert(vectors=[{"id": f"lead_{uuid.uuid4()}", "values": [0.0]*768, "metadata": log_meta}], namespace=req.get("client_id", "default"))
+        
+        return {"status": "success"}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
 
 @app.post("/get-config")
 async def get_conf(req: StatusRequest):
@@ -88,18 +125,6 @@ async def get_conf(req: StatusRequest):
         return {"bot_name": "Support", "bot_color": "#4F46E5"}
     except: return {"bot_name": "Support", "bot_color": "#4F46E5"}
 
-@app.post("/get-stats")
-async def stats_engine(req: StatusRequest):
-    chat_res = index.query(namespace=req.client_id, vector=[0.0]*768, filter={"type": "chat_log"}, top_k=10000, include_metadata=True)
-    sessions = set([m['metadata'].get('session') for m in chat_res['matches']])
-    lead_res = index.query(namespace=req.client_id, vector=[0.0]*768, filter={"type": "lead"}, top_k=10000)
-    return {"visitors": len(sessions), "chats": len(chat_res['matches']), "leads": len(lead_res['matches'])}
-
-@app.post("/get-leads")
-async def leads_engine(req: StatusRequest):
-    res = index.query(namespace=req.client_id, vector=[0.0]*768, filter={"type": "lead"}, top_k=100, include_metadata=True)
-    return {"leads": [m['metadata'] for m in res['matches']]}
-
 @app.post("/train")
 async def train_saas_engine(req: TrainRequest):
     meta = req.dict(); meta["type"] = "config"
@@ -107,4 +132,4 @@ async def train_saas_engine(req: TrainRequest):
     return {"status": "success"}
 
 @app.get("/")
-def health(): return {"status": "Omni-Brain v27.2 Active"}
+def health(): return {"status": "Omni-Brain v27.2 Active - Synced to MySQL"}

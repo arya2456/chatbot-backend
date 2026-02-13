@@ -1,11 +1,8 @@
-fastapi>=0.115.0
-uvicorn>=0.30.0
-python-multipart
-pydantic>=2.9.0
-pinecone-client>=5.0.0
-google-generativeai>=0.8.0
-beautifulsoup4
+fastapi
+uvicorn
 aiohttp
+pydantic
+pinecone
+beautifulsoup4
 pypdf
-requests
-python-dotenv
+google-generativeai

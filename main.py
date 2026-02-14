@@ -1,4 +1,4 @@
-import os, time, asyncio, logging, uuid, re, json, hashlib, io
+import os, time, asyncio, logging, uuid, re, json, hashlib, io, requests
 from typing import Dict, List, Optional
 from urllib.parse import urljoin, urlparse
 from fastapi import FastAPI, BackgroundTasks, UploadFile, File, Form, HTTPException
@@ -91,10 +91,11 @@ async def saas_brain_chat(req: ChatRequest):
                 "user_msg": req.message,
                 "bot_msg": ans
             }
-            async with aiohttp.ClientSession() as session:
-                await session.post(f"{PHP_DASHBOARD_URL}?action=save_chat", json=payload)
+            # Using synchronous requests for guaranteed delivery
+            db_response = requests.post(f"{PHP_DASHBOARD_URL}?action=save_chat", json=payload, timeout=3)
+            logger.info(f"MySQL Sync Status: {db_response.status_code}")
         except Exception as db_err:
-            logger.error(f"Failed to sync to MySQL: {db_err}")
+            logger.error(f"FATAL: Could not sync to MySQL: {db_err}")
 
         return {"answer": ans}
     except Exception as e: return {"answer": f"System error: {str(e)}"}

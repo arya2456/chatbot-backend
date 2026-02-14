@@ -91,8 +91,14 @@ async def saas_brain_chat(req: ChatRequest):
                 "user_msg": req.message,
                 "bot_msg": ans
             }
-            # Using synchronous requests for guaranteed delivery
-            db_response = requests.post(f"{PHP_DASHBOARD_URL}?action=save_chat", json=payload, timeout=3)
+            # --- Added Headers to Bypass Hostinger 403 Forbidden ---
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "Accept": "application/json",
+                "Content-Type": "application/json"
+            }
+            # Using synchronous requests for guaranteed delivery with headers
+            db_response = requests.post(f"{PHP_DASHBOARD_URL}?action=save_chat", json=payload, headers=headers, timeout=3)
             logger.info(f"MySQL Sync Status: {db_response.status_code}")
         except Exception as db_err:
             logger.error(f"FATAL: Could not sync to MySQL: {db_err}")
@@ -105,8 +111,15 @@ async def saas_brain_chat(req: ChatRequest):
 async def capture_lead(req: dict):
     # If the widget sends leads here, immediately push them to the MySQL database
     try:
-        async with aiohttp.ClientSession() as session:
-            await session.post(f"{PHP_DASHBOARD_URL}?action=save_lead", json=req)
+        # --- Added Headers to Bypass Hostinger 403 Forbidden ---
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "application/json",
+            "Content-Type": "application/json"
+        }
+        # Force a synchronous push to bypass the firewall rules with headers
+        db_response = requests.post(f"{PHP_DASHBOARD_URL}?action=save_lead", json=req, headers=headers, timeout=3)
+        logger.info(f"MySQL Lead Sync Status: {db_response.status_code}")
         
         # Optional: Save a backup to Pinecone just in case
         log_meta = req

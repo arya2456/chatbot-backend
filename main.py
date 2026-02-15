@@ -10,6 +10,9 @@ import aiohttp, pypdf
 import google.generativeai as genai
 from contextlib import asynccontextmanager
 
+# --- ADDED: Import your new scraper module ---
+import scraper 
+
 # --- 1. CONFIG ---
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
 PINECONE_INDEX_NAME = os.getenv("PINECONE_INDEX_NAME", "chatbot-index")
@@ -18,6 +21,9 @@ PHP_DASHBOARD_URL = "https://dashboard.fcmedia.in/api.php"
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# --- ADDED: A temporary memory bank to track crawl progress for the dashboard ---
+crawl_status_db = {}
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -60,6 +66,42 @@ def safe_embed(text, api_key):
     genai.configure(api_key=api_key)
     try: return genai.embed_content(model="models/embedding-001", content=text)['embedding']
     except: return [0.0] * 768
+
+# --- ADDED: The Heavy Engine Room Task for Scrapping ---
+async def perform_deep_sync(client_id: str, url: str, api_key: str):
+    crawl_status_db[client_id] = {"status": "crawling", "progress": 10, "pages": 0}
+    try:
+        # 1. Start the Scrape!
+        pages_data = scraper.crawl_website(url, max_pages=15)
+        crawl_status_db[client_id] = {"status": "crawling", "progress": 50, "pages": len(pages_data)}
+        
+        # 2. Chop text into AI-friendly chunks (Vectors)
+        vectors = []
+        for page in pages_data:
+            words = page['text'].split()
+            # Split page into chunks of ~200 words
+            chunks = [' '.join(words[i:i+200]) for i in range(0, len(words), 200)]
+            
+            for chunk in chunks:
+                if len(chunk) > 20: # Ignore tiny useless chunks
+                    emb = safe_embed(chunk, api_key)
+                    vectors.append({
+                        "id": f"doc_{uuid.uuid4()}",
+                        "values": emb,
+                        "metadata": {"type": "knowledge", "text": chunk, "url": page["url"]}
+                    })
+        
+        # 3. Push to Pinecone in safe batches
+        if vectors:
+            batch_size = 50
+            for i in range(0, len(vectors), batch_size):
+                index.upsert(vectors=vectors[i:i+batch_size], namespace=client_id)
+                
+        crawl_status_db[client_id] = {"status": "complete", "progress": 100, "pages": len(pages_data)}
+        logger.info(f"Deep sync complete for {client_id}")
+    except Exception as e:
+        logger.error(f"Deep sync failed: {str(e)}")
+        crawl_status_db[client_id] = {"status": "error", "progress": 0, "pages": 0}
 
 # --- 4. ENGINE ---
 @app.post("/chat")
@@ -139,11 +181,35 @@ async def get_conf(req: StatusRequest):
         return {"bot_name": "Support", "bot_color": "#4F46E5"}
     except: return {"bot_name": "Support", "bot_color": "#4F46E5"}
 
+# --- UPDATED: Smarter Train Endpoint to support Scrapping ---
 @app.post("/train")
-async def train_saas_engine(req: TrainRequest):
-    meta = req.dict(); meta["type"] = "config"
+async def train_saas_engine(req: TrainRequest, background_tasks: BackgroundTasks):
+    try:
+        res = index.fetch(ids=[f"config_{req.client_id}"], namespace=req.client_id)
+        existing_conf = res.vectors[f"config_{req.client_id}"].metadata if res.vectors else {}
+    except:
+        existing_conf = {}
+
+    # Extract only the data sent by the dashboard, avoiding defaults from overwriting your config
+    incoming_data = req.model_dump(exclude_unset=True) if hasattr(req, 'model_dump') else req.dict(exclude_unset=True)
+    
+    meta = existing_conf.copy()
+    meta.update(incoming_data)
+    meta["type"] = "config"
+    
     index.upsert(vectors=[{"id": f"config_{req.client_id}", "values": [1.0]*768, "metadata": meta}], namespace=req.client_id)
+    
+    # If the user pushed the "Deep Sync Site" button, trigger the scraper!
+    active_key = meta.get("gemini_api_key", req.gemini_api_key)
+    if incoming_data.get("url"):
+        background_tasks.add_task(perform_deep_sync, req.client_id, meta.get("url", ""), active_key)
+        
     return {"status": "success"}
+
+# --- ADDED: The Endpoint that talks to the Dashboard Progress Bar ---
+@app.post("/get-crawl-status")
+async def get_crawl_status(req: StatusRequest):
+    return crawl_status_db.get(req.client_id, {"status": "idle", "progress": 0, "pages": 0})
 
 @app.get("/")
 def health(): return {"status": "Omni-Brain v27.2 Active - Synced to MySQL"}

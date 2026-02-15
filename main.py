@@ -85,11 +85,15 @@ async def perform_deep_sync(client_id: str, url: str, api_key: str):
             for chunk in chunks:
                 if len(chunk) > 20: # Ignore tiny useless chunks
                     emb = safe_embed(chunk, api_key)
-                    vectors.append({
-                        "id": f"doc_{uuid.uuid4()}",
-                        "values": emb,
-                        "metadata": {"type": "knowledge", "text": chunk, "url": page["url"]}
-                    })
+                    # FIX: Only append if the vector has valid data (not all zeros)
+                    if any(v != 0.0 for v in emb):
+                        vectors.append({
+                            "id": f"doc_{uuid.uuid4()}",
+                            "values": emb,
+                            "metadata": {"type": "knowledge", "text": chunk, "url": page["url"]}
+                        })
+                    else:
+                        logger.warning("Skipped a chunk because Gemini failed to embed it.")
         
         # 3. Push to Pinecone in safe batches
         if vectors:

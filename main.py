@@ -69,8 +69,8 @@ def safe_embed(text, api_key):
         
     genai.configure(api_key=api_key)
     try: 
-        # Using Google's newest and most stable embedding model
-        return genai.embed_content(model="models/text-embedding-004", content=text)['embedding']
+        # FIX: Reverted to the universally supported embedding model name
+        return genai.embed_content(model="models/embedding-001", content=text)['embedding']
     except Exception as e: 
         logger.error(f"Gemini Embed Error: {str(e)}")
         return [0.0] * 768

@@ -63,9 +63,17 @@ def get_model(api_key):
     return genai.GenerativeModel("gemini-2.5-flash")
 
 def safe_embed(text, api_key):
+    if not api_key or len(api_key) < 10:
+        logger.error("Gemini Embed Error: Missing or invalid API key.")
+        return [0.0] * 768
+        
     genai.configure(api_key=api_key)
-    try: return genai.embed_content(model="models/embedding-001", content=text)['embedding']
-    except: return [0.0] * 768
+    try: 
+        # Using Google's newest and most stable embedding model
+        return genai.embed_content(model="models/text-embedding-004", content=text)['embedding']
+    except Exception as e: 
+        logger.error(f"Gemini Embed Error: {str(e)}")
+        return [0.0] * 768
 
 # --- ADDED: The Heavy Engine Room Task for Scrapping ---
 async def perform_deep_sync(client_id: str, url: str, api_key: str):

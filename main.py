@@ -68,8 +68,18 @@ def safe_embed(text, api_key):
         return [0.0] * 768
         
     genai.configure(api_key=api_key)
+    
+    # --- ADDED: The "Print the Menu" Logic ---
+    try:
+        models = genai.list_models()
+        embed_models = [m.name for m in models if 'embedContent' in m.supported_generation_methods]
+        logger.info(f"AVAILABLE EMBEDDING MODELS: {embed_models}")
+    except Exception as e:
+        logger.error(f"Failed to fetch model list: {e}")
+    # ------------------------------------------
+
     try: 
-        # FIX: Reverted to the universally supported embedding model name
+        # We will keep this as a placeholder while we wait for the log printout
         return genai.embed_content(model="models/embedding-001", content=text)['embedding']
     except Exception as e: 
         logger.error(f"Gemini Embed Error: {str(e)}")

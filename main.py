@@ -29,7 +29,7 @@ crawl_status_db = {}
 async def lifespan(app: FastAPI):
     yield
 
-app = FastAPI(title="Omni-Brain v27.2", lifespan=lifespan)
+app = FastAPI(title="Omni-Brain v27.3", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 def connect_db():
@@ -69,8 +69,14 @@ def safe_embed(text, api_key):
         
     genai.configure(api_key=api_key)
     try: 
-        # FIX: Using the exact model name Google confirmed is available
-        return genai.embed_content(model="models/gemini-embedding-001", content=text)['embedding']
+        # 1. Generate the embedding (It will be 3072 dimensions)
+        emb = genai.embed_content(model="models/gemini-embedding-001", content=text)['embedding']
+        
+        # 2. CRITICAL FIX: Slice it down to 768 to fit your database
+        if len(emb) > 768:
+            return emb[:768]
+            
+        return emb
     except Exception as e: 
         logger.error(f"Gemini Embed Error: {str(e)}")
         return [0.0] * 768
@@ -209,6 +215,7 @@ async def train_saas_engine(req: TrainRequest, background_tasks: BackgroundTasks
     meta.update(incoming_data)
     meta["type"] = "config"
     
+    # Ensuring the config vector matches the index dimension (768)
     index.upsert(vectors=[{"id": f"config_{req.client_id}", "values": [1.0]*768, "metadata": meta}], namespace=req.client_id)
     
     # If the user pushed the "Deep Sync Site" button, trigger the scraper!
@@ -224,4 +231,4 @@ async def get_crawl_status(req: StatusRequest):
     return crawl_status_db.get(req.client_id, {"status": "idle", "progress": 0, "pages": 0})
 
 @app.get("/")
-def health(): return {"status": "Omni-Brain v27.2 Active - Synced to MySQL"}
+def health(): return {"status": "Omni-Brain v27.3 - FORCE FIT ACTIVE"}

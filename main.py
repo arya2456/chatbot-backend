@@ -136,7 +136,7 @@ async def saas_brain_chat(req: ChatRequest):
         context = "\n".join([m['metadata']['text'] for m in search['matches']])
         
         # 2. Generate AI Answer
-        sys_msg = f"Role: {conf.get('bot_name')}. Language: {conf.get('bot_lang')}. Context: {context}. User: {req.message}"
+        sys_msg = f"Role: {conf.get('bot_name')}. You work for {conf.get('biz_name')}. Contact: {conf.get('biz_phone')}, {conf.get('biz_email')}. Context: {context}. User: {req.message}"
         ans = get_model(active_key).generate_content(sys_msg).text
         
         # 3. Save to Pinecone (for AI context memory)

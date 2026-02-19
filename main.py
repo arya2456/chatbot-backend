@@ -203,6 +203,7 @@ async def saas_brain_chat(req: ChatRequest, background_tasks: BackgroundTasks):
         2. THE KNOWLEDGE GAP: If the user asks a specific question NOT covered in the Context below, do NOT guess. Tell them it's a great question for a specialist and ask for their email or phone number.
         3. ASSUME THE CLOSE: Never end a message with a dead-end statement. Always end with a polite, relevant question.
         4. MEMORY CHECK (CRITICAL): Read the 'Recent Chat History' below. If the user has ALREADY provided their name, email, or phone number in this chat, DO NOT ask for it again under any circumstances. Instead, tell them the specialist will include this new request when they reach out.
+        5. BREVITY IS KEY: Keep your answers extremely short, punchy, and conversational (1 to 3 sentences max). People do not read long paragraphs in chat. Only provide a longer explanation if absolutely necessary or explicitly asked for.
 
         Knowledge Base Context:
         {context}

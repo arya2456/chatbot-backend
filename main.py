@@ -29,7 +29,7 @@ crawl_status_db = {}
 async def lifespan(app: FastAPI):
     yield
 
-app = FastAPI(title="Omni-Brain v27.3", lifespan=lifespan)
+app = FastAPI(title="Omni-Brain v28.0", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 def connect_db():
@@ -81,6 +81,49 @@ def safe_embed(text, api_key):
         logger.error(f"Gemini Embed Error: {str(e)}")
         return [0.0] * 768
 
+# --- ADDED: The Silent SDR (Lead Extractor) ---
+async def extract_and_save_lead(user_msg: str, client_id: str, api_key: str):
+    """Silently scans messages for contact info and pushes to MySQL CRM."""
+    # Fast check: Only run AI if there's an '@' symbol or a cluster of numbers
+    if "@" not in user_msg and len(re.findall(r'\d', user_msg)) < 7:
+        return
+
+    try:
+        genai.configure(api_key=api_key)
+        model = genai.GenerativeModel("gemini-2.5-flash")
+        
+        prompt = f"""
+        Analyze this text: "{user_msg}". 
+        Extract any names, emails, phone numbers, or company names mentioned.
+        Return ONLY a raw JSON object with keys: "name", "email", "phone", "company". 
+        If a field is missing, use null. Do not write markdown or code blocks, just the JSON string.
+        """
+        resp = model.generate_content(prompt)
+        cleaned_json = resp.text.replace("```json", "").replace("```", "").strip()
+        lead_data = json.loads(cleaned_json)
+        
+        # If actionable data is found, push to Dashboard
+        if lead_data.get("email") or lead_data.get("phone"):
+            payload = {
+                "client_id": client_id,
+                "email": lead_data.get("email") or "Unknown",
+                "phone": lead_data.get("phone") or "",
+                "name": lead_data.get("name") or "Website Visitor",
+                "company": lead_data.get("company") or "",
+                "message": user_msg 
+            }
+            # Add Hostinger bypass headers just in case
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "Accept": "application/json",
+                "Content-Type": "application/json"
+            }
+            requests.post(f"{PHP_DASHBOARD_URL}?action=save_lead", json=payload, headers=headers, timeout=5)
+            logger.info(f"💰 SILENT LEAD CAPTURED: {lead_data.get('email') or lead_data.get('phone')}")
+            
+    except Exception as e:
+        logger.error(f"Lead extraction failed silently: {e}")
+
 # --- ADDED: The Heavy Engine Room Task for Scrapping ---
 async def perform_deep_sync(client_id: str, url: str, api_key: str):
     crawl_status_db[client_id] = {"status": "crawling", "progress": 10, "pages": 0}
@@ -123,7 +166,7 @@ async def perform_deep_sync(client_id: str, url: str, api_key: str):
 
 # --- 4. ENGINE ---
 @app.post("/chat")
-async def saas_brain_chat(req: ChatRequest):
+async def saas_brain_chat(req: ChatRequest, background_tasks: BackgroundTasks):
     try:
         # 1. Get Config & Context
         res = index.fetch(ids=[f"config_{req.client_id}"], namespace=req.client_id)
@@ -131,19 +174,39 @@ async def saas_brain_chat(req: ChatRequest):
         active_key = req.api_key if len(req.api_key) > 10 else conf.get("gemini_api_key", "")
         if not active_key: return {"answer": "API Key missing."}
 
+        # 2. TRIGGER SILENT SALESMAN (Runs in background so it doesn't slow down the chat)
+        background_tasks.add_task(extract_and_save_lead, req.message, req.client_id, active_key)
+
+        # 3. Fetch Knowledge
         emb = safe_embed(req.message, active_key)
         search = index.query(namespace=req.client_id, vector=emb, top_k=3, include_metadata=True, filter={"type": "knowledge"})
         context = "\n".join([m['metadata']['text'] for m in search['matches']])
         
-        # 2. Generate AI Answer
-        sys_msg = f"Role: {conf.get('bot_name')}. You work for {conf.get('biz_name')}. Contact: {conf.get('biz_phone')}, {conf.get('biz_email')}. Context: {context}. User: {req.message}"
+        # 4. UNIVERSAL SALES PROMPT
+        biz_contact = f"Contact: {conf.get('biz_phone', '')}, {conf.get('biz_email', '')}."
+        
+        sys_msg = f"""
+        Role: You are {conf.get('bot_name')}, a professional AI assistant for {conf.get('biz_name')}.
+        Personality: {conf.get('bot_personality')}.
+        Business Details: {biz_contact}
+
+        CRITICAL SALES RULES (UNIVERSAL SDR):
+        1. CONVERSATIONAL DRIP: If the user asks about pricing, buying, or booking, do not give away everything at once. Naturally ask for their Name or Email first to "send them the details" or "check availability".
+        2. THE KNOWLEDGE GAP: If the user asks a specific question NOT covered in the Context below, do NOT guess. Tell them it's a great question for a specialist and ask for their email or phone number so an expert can reach out.
+        3. ASSUME THE CLOSE: Never end a message with a dead-end statement. Always end with a polite, relevant question that keeps the conversation moving toward capturing their contact info or moving to the next step.
+
+        Knowledge Base Context:
+        {context}
+
+        User Message: {req.message}
+        """
+        
         ans = get_model(active_key).generate_content(sys_msg).text
         
-        # 3. Save to Pinecone (for AI context memory)
+        # 5. Save Logs to Pinecone & MySQL
         log_meta = {"type": "chat_log", "session": req.session_id, "user_msg": req.message, "bot_msg": ans, "timestamp": int(time.time())}
         index.upsert(vectors=[{"id": f"log_{uuid.uuid4()}", "values": [0.1]*768, "metadata": log_meta}], namespace=req.client_id)
         
-        # 4. PUSH TO MYSQL BRAIN (For Dashboard Analytics)
         try:
             payload = {
                 "client_id": req.client_id,
@@ -231,4 +294,4 @@ async def get_crawl_status(req: StatusRequest):
     return crawl_status_db.get(req.client_id, {"status": "idle", "progress": 0, "pages": 0})
 
 @app.get("/")
-def health(): return {"status": "Omni-Brain v27.3 - FORCE FIT ACTIVE"}
+def health(): return {"status": "Omni-Brain v28.0 - Universal SDR Active"}

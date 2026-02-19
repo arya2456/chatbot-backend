@@ -24,6 +24,8 @@ logger = logging.getLogger(__name__)
 
 # --- ADDED: A temporary memory bank to track crawl progress for the dashboard ---
 crawl_status_db = {}
+# --- ADDED: Short-term memory for active chats so the bot remembers the user ---
+session_memory = {}
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -182,6 +184,12 @@ async def saas_brain_chat(req: ChatRequest, background_tasks: BackgroundTasks):
         search = index.query(namespace=req.client_id, vector=emb, top_k=3, include_metadata=True, filter={"type": "knowledge"})
         context = "\n".join([m['metadata']['text'] for m in search['matches']])
         
+        # --- NEW: Retrieve Short-Term Memory ---
+        if req.session_id not in session_memory:
+            session_memory[req.session_id] = []
+        # Get the last 6 interactions (3 turns)
+        history_text = "\n".join(session_memory[req.session_id][-6:])
+        
         # 4. UNIVERSAL SALES PROMPT
         biz_contact = f"Contact: {conf.get('biz_phone', '')}, {conf.get('biz_email', '')}."
         
@@ -191,17 +199,28 @@ async def saas_brain_chat(req: ChatRequest, background_tasks: BackgroundTasks):
         Business Details: {biz_contact}
 
         CRITICAL SALES RULES (UNIVERSAL SDR):
-        1. CONVERSATIONAL DRIP: If the user asks about pricing, buying, or booking, do not give away everything at once. Naturally ask for their Name or Email first to "send them the details" or "check availability".
-        2. THE KNOWLEDGE GAP: If the user asks a specific question NOT covered in the Context below, do NOT guess. Tell them it's a great question for a specialist and ask for their email or phone number so an expert can reach out.
-        3. ASSUME THE CLOSE: Never end a message with a dead-end statement. Always end with a polite, relevant question that keeps the conversation moving toward capturing their contact info or moving to the next step.
+        1. CONVERSATIONAL DRIP: If the user asks about pricing, buying, or booking, do not give away everything at once. Naturally ask for their Name or Email first.
+        2. THE KNOWLEDGE GAP: If the user asks a specific question NOT covered in the Context below, do NOT guess. Tell them it's a great question for a specialist and ask for their email or phone number.
+        3. ASSUME THE CLOSE: Never end a message with a dead-end statement. Always end with a polite, relevant question.
+        4. MEMORY CHECK (CRITICAL): Read the 'Recent Chat History' below. If the user has ALREADY provided their name, email, or phone number in this chat, DO NOT ask for it again under any circumstances. Instead, tell them the specialist will include this new request when they reach out.
 
         Knowledge Base Context:
         {context}
 
-        User Message: {req.message}
+        Recent Chat History:
+        {history_text}
+
+        Current User Message: {req.message}
         """
         
         ans = get_model(active_key).generate_content(sys_msg).text
+        
+        # --- NEW: Save to Short-Term Memory ---
+        session_memory[req.session_id].append(f"User: {req.message}")
+        session_memory[req.session_id].append(f"Bot: {ans}")
+        # Prevent memory from getting too heavy (keep last 10)
+        if len(session_memory[req.session_id]) > 10:
+            session_memory[req.session_id] = session_memory[req.session_id][-10:]
         
         # 5. Save Logs to Pinecone & MySQL
         log_meta = {"type": "chat_log", "session": req.session_id, "user_msg": req.message, "bot_msg": ans, "timestamp": int(time.time())}

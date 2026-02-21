@@ -10,7 +10,7 @@ import aiohttp, pypdf
 import google.generativeai as genai
 from contextlib import asynccontextmanager
 
-# --- ADDED: Import your new scraper module ---
+# --- Import your new scraper module ---
 import scraper 
 
 # --- 1. CONFIG ---
@@ -22,16 +22,16 @@ PHP_DASHBOARD_URL = "https://dashboard.fcmedia.in/api.php"
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# --- ADDED: A temporary memory bank to track crawl progress for the dashboard ---
+# A temporary memory bank to track crawl progress for the dashboard
 crawl_status_db = {}
-# --- ADDED: Short-term memory for active chats so the bot remembers the user ---
+# Short-term memory for active chats so the bot remembers the user
 session_memory = {}
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     yield
 
-app = FastAPI(title="Omni-Brain v28.0", lifespan=lifespan)
+app = FastAPI(title="Omni-Brain v28.1", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 def connect_db():
@@ -71,10 +71,10 @@ def safe_embed(text, api_key):
         
     genai.configure(api_key=api_key)
     try: 
-        # 1. Generate the embedding (It will be 3072 dimensions)
+        # 1. Generate the embedding
         emb = genai.embed_content(model="models/gemini-embedding-001", content=text)['embedding']
         
-        # 2. CRITICAL FIX: Slice it down to 768 to fit your database
+        # 2. Slice it down to 768 to fit your database
         if len(emb) > 768:
             return emb[:768]
             
@@ -83,7 +83,7 @@ def safe_embed(text, api_key):
         logger.error(f"Gemini Embed Error: {str(e)}")
         return [0.0] * 768
 
-# --- ADDED: The Silent SDR (Lead Extractor) ---
+# --- The Silent SDR (Lead Extractor) ---
 async def extract_and_save_lead(user_msg: str, client_id: str, api_key: str):
     """Silently scans messages for contact info and pushes to MySQL CRM."""
     # Fast check: Only run AI if there's an '@' symbol or a cluster of numbers
@@ -126,7 +126,7 @@ async def extract_and_save_lead(user_msg: str, client_id: str, api_key: str):
     except Exception as e:
         logger.error(f"Lead extraction failed silently: {e}")
 
-# --- ADDED: The Heavy Engine Room Task for Scrapping ---
+# --- The Heavy Engine Room Task for Scrapping ---
 async def perform_deep_sync(client_id: str, url: str, api_key: str):
     crawl_status_db[client_id] = {"status": "crawling", "progress": 10, "pages": 0}
     try:
@@ -144,7 +144,6 @@ async def perform_deep_sync(client_id: str, url: str, api_key: str):
             for chunk in chunks:
                 if len(chunk) > 20: # Ignore tiny useless chunks
                     emb = safe_embed(chunk, api_key)
-                    # FIX: Only append if the vector has valid data (not all zeros)
                     if any(v != 0.0 for v in emb):
                         vectors.append({
                             "id": f"doc_{uuid.uuid4()}",
@@ -176,21 +175,25 @@ async def saas_brain_chat(req: ChatRequest, background_tasks: BackgroundTasks):
         active_key = req.api_key if len(req.api_key) > 10 else conf.get("gemini_api_key", "")
         if not active_key: return {"answer": "API Key missing."}
 
-        # 2. TRIGGER SILENT SALESMAN (Runs in background so it doesn't slow down the chat)
+        # 2. TRIGGER SILENT SALESMAN
         background_tasks.add_task(extract_and_save_lead, req.message, req.client_id, active_key)
 
-        # 3. Fetch Knowledge
+        # 3. Fetch Knowledge (Now includes URLs!)
         emb = safe_embed(req.message, active_key)
         search = index.query(namespace=req.client_id, vector=emb, top_k=3, include_metadata=True, filter={"type": "knowledge"})
-        context = "\n".join([m['metadata']['text'] for m in search['matches']])
         
-        # --- NEW: Retrieve Short-Term Memory ---
+        context = ""
+        for match in search['matches']:
+            text = match['metadata'].get('text', '')
+            url = match['metadata'].get('url', 'No link available')
+            context += f"Content: {text}\nURL: {url}\n\n"
+        
+        # 4. Retrieve Short-Term Memory
         if req.session_id not in session_memory:
             session_memory[req.session_id] = []
-        # Get the last 6 interactions (3 turns)
         history_text = "\n".join(session_memory[req.session_id][-6:])
         
-        # 4. UNIVERSAL SALES PROMPT
+        # 5. UNIVERSAL SALES PROMPT
         biz_contact = f"Contact: {conf.get('biz_phone', '')}, {conf.get('biz_email', '')}."
         
         sys_msg = f"""
@@ -203,7 +206,9 @@ async def saas_brain_chat(req: ChatRequest, background_tasks: BackgroundTasks):
         2. THE KNOWLEDGE GAP: If the user asks a specific question NOT covered in the Context below, do NOT guess. Tell them it's a great question for a specialist and ask for their email or phone number.
         3. ASSUME THE CLOSE: Never end a message with a dead-end statement. Always end with a polite, relevant question.
         4. MEMORY CHECK (CRITICAL): Read the 'Recent Chat History' below. If the user has ALREADY provided their name, email, or phone number in this chat, DO NOT ask for it again under any circumstances. Instead, tell them the specialist will include this new request when they reach out.
-        5. BREVITY IS KEY: Keep your answers extremely short, punchy, and conversational (1 to 3 sentences max). People do not read long paragraphs in chat. Only provide a longer explanation if absolutely necessary or explicitly asked for.
+        5. BREVITY IS KEY: Keep your answers extremely short, punchy, and conversational (1 to 3 sentences max). People do not read long paragraphs in chat.
+        6. STRICT DATA VALIDATION: If a user attempts to provide contact info, verify it is real. A valid email MUST contain an "@" symbol and a domain. A valid phone number MUST contain at least 7-10 digits. If the user provides gibberish or incomplete details (like "hh", "abc", "123", or just a first name when you need an email), politely explain that it seems invalid and ask for a real email or phone number so you can connect them with the team.
+        7. PROVIDE LINKS: If the Knowledge Base Context below contains URLs relevant to the user's question, you MUST give them the link (e.g., "You can read more about this here: [Insert URL]").
 
         Knowledge Base Context:
         {context}
@@ -216,14 +221,13 @@ async def saas_brain_chat(req: ChatRequest, background_tasks: BackgroundTasks):
         
         ans = get_model(active_key).generate_content(sys_msg).text
         
-        # --- NEW: Save to Short-Term Memory ---
+        # 6. Save to Short-Term Memory
         session_memory[req.session_id].append(f"User: {req.message}")
         session_memory[req.session_id].append(f"Bot: {ans}")
-        # Prevent memory from getting too heavy (keep last 10)
         if len(session_memory[req.session_id]) > 10:
             session_memory[req.session_id] = session_memory[req.session_id][-10:]
         
-        # 5. Save Logs to Pinecone & MySQL
+        # 7. Save Logs to Pinecone & MySQL
         log_meta = {"type": "chat_log", "session": req.session_id, "user_msg": req.message, "bot_msg": ans, "timestamp": int(time.time())}
         index.upsert(vectors=[{"id": f"log_{uuid.uuid4()}", "values": [0.1]*768, "metadata": log_meta}], namespace=req.client_id)
         
@@ -234,13 +238,11 @@ async def saas_brain_chat(req: ChatRequest, background_tasks: BackgroundTasks):
                 "user_msg": req.message,
                 "bot_msg": ans
             }
-            # --- Added Headers to Bypass Hostinger 403 Forbidden ---
             headers = {
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
                 "Accept": "application/json",
                 "Content-Type": "application/json"
             }
-            # Using synchronous requests for guaranteed delivery with headers
             db_response = requests.post(f"{PHP_DASHBOARD_URL}?action=save_chat", json=payload, headers=headers, timeout=3)
             logger.info(f"MySQL Sync Status: {db_response.status_code}")
         except Exception as db_err:
@@ -254,13 +256,11 @@ async def saas_brain_chat(req: ChatRequest, background_tasks: BackgroundTasks):
 async def capture_lead(req: dict):
     # If the widget sends leads here, immediately push them to the MySQL database
     try:
-        # --- Added Headers to Bypass Hostinger 403 Forbidden ---
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
             "Accept": "application/json",
             "Content-Type": "application/json"
         }
-        # Force a synchronous push to bypass the firewall rules with headers
         db_response = requests.post(f"{PHP_DASHBOARD_URL}?action=save_lead", json=req, headers=headers, timeout=3)
         logger.info(f"MySQL Lead Sync Status: {db_response.status_code}")
         
@@ -282,7 +282,7 @@ async def get_conf(req: StatusRequest):
         return {"bot_name": "Support", "bot_color": "#4F46E5"}
     except: return {"bot_name": "Support", "bot_color": "#4F46E5"}
 
-# --- UPDATED: Smarter Train Endpoint to support Scrapping ---
+# --- Smarter Train Endpoint to support Scrapping ---
 @app.post("/train")
 async def train_saas_engine(req: TrainRequest, background_tasks: BackgroundTasks):
     try:
@@ -308,10 +308,10 @@ async def train_saas_engine(req: TrainRequest, background_tasks: BackgroundTasks
         
     return {"status": "success"}
 
-# --- ADDED: The Endpoint that talks to the Dashboard Progress Bar ---
+# --- The Endpoint that talks to the Dashboard Progress Bar ---
 @app.post("/get-crawl-status")
 async def get_crawl_status(req: StatusRequest):
     return crawl_status_db.get(req.client_id, {"status": "idle", "progress": 0, "pages": 0})
 
 @app.get("/")
-def health(): return {"status": "Omni-Brain v28.0 - Universal SDR Active"}
+def health(): return {"status": "Omni-Brain v28.1 - Universal SDR Active"}

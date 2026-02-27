@@ -2,6 +2,7 @@ import requests
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin, urlparse
 import logging
+import re
 
 logger = logging.getLogger(__name__)
 
@@ -34,23 +35,45 @@ def crawl_website(start_url: str, max_pages: int = 15) -> list:
                 continue
                 
             soup = BeautifulSoup(response.text, 'html.parser')
-            
-            # --- THE SNIPER FIX ---
-            # Instead of grabbing everything, ONLY grab actual readable text tags
-            valid_tags = ['h1', 'h2', 'h3', 'h4', 'h5', 'p', 'li', 'span']
             page_text_parts = []
+
+            # 1. GRAB VITAL METADATA (Who are they?)
+            if current_url == start_url:
+                title = soup.title.string if soup.title else ""
+                desc_tag = soup.find('meta', attrs={'name': 'description'})
+                desc = desc_tag['content'] if desc_tag else ""
+                if title or desc:
+                    page_text_parts.append(f"COMPANY OVERVIEW: {title}. {desc}.")
+
+            # 2. TARGET FOOTER, HEADER, & ADDRESS EXPLICITLY (Contact Info)
+            for structural_tag in soup.find_all(['footer', 'header', 'address', 'nav']):
+                struct_text = structural_tag.get_text(separator=' | ', strip=True)
+                # Clean up the pipe separators
+                struct_text = re.sub(r'\|\s*\|', '|', struct_text)
+                if len(struct_text) > 10 and '{' not in struct_text:
+                    page_text_parts.append(f"BUSINESS INFO/NAVIGATION: {struct_text}")
+                # Remove these tags so we don't duplicate them in the next step
+                structural_tag.decompose() 
+
+            # 3. GRAB THE MAIN BODY CONTENT
+            valid_tags = ['h1', 'h2', 'h3', 'h4', 'h5', 'p', 'li', 'span', 'td', 'a']
             
             for tag in soup.find_all(valid_tags):
                 text = tag.get_text(separator=' ', strip=True)
-                # Filter out tiny words and curly braces (which usually means it accidentally grabbed CSS/JS code)
-                if len(text) > 20 and '{' not in text and 'function(' not in text:
-                    page_text_parts.append(text)
+                
+                # We want to keep it if it's long enough, OR if it looks like an email/phone number
+                is_contact_info = '@' in text or re.search(r'\+?\d{10}', text)
+                
+                if (len(text) > 20 or is_contact_info) and '{' not in text and 'function(' not in text and 'var ' not in text:
+                    # Don't add if it's already in the list to prevent weird looping repeats
+                    if text not in page_text_parts:
+                        page_text_parts.append(text)
             
-            # Join all the clean paragraphs together
-            clean_text = " ".join(page_text_parts)
+            # Join everything logically
+            clean_text = "\n\n".join(page_text_parts)
             
             # If we found actual content, save it!
-            if len(clean_text) > 100:
+            if len(clean_text) > 50:
                 extracted_data.append({
                     "url": current_url,
                     "text": clean_text
@@ -58,6 +81,7 @@ def crawl_website(start_url: str, max_pages: int = 15) -> list:
             
             visited.add(current_url)
             
+            # Find more links to crawl
             for link in soup.find_all('a', href=True):
                 next_url = urljoin(start_url, link['href']).split('#')[0]
                 next_domain = urlparse(next_url).netloc

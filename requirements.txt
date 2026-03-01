@@ -6,3 +6,5 @@ pinecone
 beautifulsoup4
 pypdf
 google-generativeai
+python-multipart
+pypdf

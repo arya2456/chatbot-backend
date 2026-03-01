@@ -179,9 +179,9 @@ async def saas_brain_chat(req: ChatRequest, background_tasks: BackgroundTasks):
         # 2. TRIGGER SILENT SALESMAN
         background_tasks.add_task(extract_and_save_lead, req.message, req.client_id, active_key)
 
-        # 3. Fetch Knowledge
+        # 3. Fetch Knowledge (Increased to 8 to guarantee it finds the links!)
         emb = safe_embed(req.message, active_key)
-        search = index.query(namespace=req.client_id, vector=emb, top_k=5, include_metadata=True, filter={"type": "knowledge"})
+        search = index.query(namespace=req.client_id, vector=emb, top_k=8, include_metadata=True, filter={"type": "knowledge"})
         
         context = ""
         for match in search['matches']:
@@ -199,7 +199,7 @@ async def saas_brain_chat(req: ChatRequest, background_tasks: BackgroundTasks):
         current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         user_current_url = req.page_url if req.page_url else "Unknown"
         
-        # --- THE UPGRADED CHAMELEON & CONCIERGE PROMPT ---
+        # --- THE BULLETPROOF CONCIERGE PROMPT ---
         sys_msg = f"""
         Role: You are {conf.get('bot_name')}, the official AI representative for {conf.get('biz_name')}.
         Requested Persona: {conf.get('bot_personality')}.
@@ -208,14 +208,13 @@ async def saas_brain_chat(req: ChatRequest, background_tasks: BackgroundTasks):
         User's Current Webpage: {user_current_url}
 
         CRITICAL BEHAVIOR RULES:
-        1. THE CHAMELEON VIBE: Analyze the 'Knowledge Base Context' below. You MUST match the tone, vibe, and writing style of the company's content. 
-        2. VALUE FIRST: Your primary job is to actually help the user. Never act like a gatekeeper. Answer their question fully FIRST.
-        3. THE LINK CONCIERGE (CRITICAL): The Context below contains items labeled "RELEVANT SITE LINK". If the user asks for a blog, a service, or more info, you MUST search the context for the most relevant link and give it to them. Format: "You can check that out right here: [Link Title](URL)".
-        4. INTELLIGENT KNOWLEDGE GAP: If a user asks for something general (like "give me a blog link") and you have multiple links in your context, DO NOT say "I don't know." Instead, pick the 1 or 2 most relevant links from the Context and offer them! If you truly have ZERO info, say: "I'm still learning our site structure, but I can have a team member email you the exact link. What's your email?"
-        5. ASSUME THE CLOSE: Do not end messages awkwardly. Always naturally move the conversation forward.
-        6. MEMORY CHECK: Read the 'Recent Chat History'. If the user already gave their email/phone, NEVER ask for it again.
+        1. THE CHAMELEON VIBE: Match the tone of the 'Knowledge Base Context' below.
+        2. VALUE FIRST: Answer the user's question fully FIRST before asking for contact info.
+        3. ANTI-HALLUCINATION (CRITICAL): NEVER guess, invent, or assume a URL. You are STRICTLY FORBIDDEN from making up links like '/blog' or '/contact'. You may ONLY provide a link if it is EXACTLY written in the 'Knowledge Base Context' below (look for "Source Link:" or "RELEVANT SITE LINK"). If the exact link is not in the context, say: "I don't have the exact link handy right now, but I can have our team email it to you. What's the best email for you?"
+        4. THE LINK CONCIERGE: If the context *does* contain the correct link, provide it naturally: "You can find more details here: [URL]". 
+        5. MEMORY CHECK: Read the 'Recent Chat History'. If the user already gave their email/phone, NEVER ask for it again.
 
-        Knowledge Base Context (Use this to answer questions and provide links!):
+        Knowledge Base Context (Your ONLY source of truth for links and facts):
         {context}
 
         Recent Chat History:
@@ -248,8 +247,7 @@ async def saas_brain_chat(req: ChatRequest, background_tasks: BackgroundTasks):
                 "Accept": "application/json",
                 "Content-Type": "application/json"
             }
-            db_response = requests.post(f"{PHP_DASHBOARD_URL}?action=save_chat", json=payload, headers=headers, timeout=3)
-            logger.info(f"MySQL Sync Status: {db_response.status_code}")
+            requests.post(f"{PHP_DASHBOARD_URL}?action=save_chat", json=payload, headers=headers, timeout=3)
         except Exception as db_err:
             logger.error(f"FATAL: Could not sync to MySQL: {db_err}")
 
@@ -317,6 +315,49 @@ async def train_saas_engine(req: TrainRequest, background_tasks: BackgroundTasks
 @app.post("/get-crawl-status")
 async def get_crawl_status(req: StatusRequest):
     return crawl_status_db.get(req.client_id, {"status": "idle", "progress": 0, "pages": 0})
+# --- MISSING DASHBOARD FEATURE: Document Upload ---
+@app.post("/upload-file")
+async def upload_document(client_id: str, file: UploadFile = File(...)):
+    try:
+        # 1. Verify API Key
+        res = index.fetch(ids=[f"config_{client_id}"], namespace=client_id)
+        conf = res.vectors[f"config_{client_id}"].metadata if res.vectors else {}
+        api_key = conf.get("gemini_api_key", "")
+        if not api_key: return {"status": "error", "message": "API Key missing."}
 
+        # 2. Read File Content
+        content = ""
+        if file.filename.lower().endswith('.pdf'):
+            pdf_reader = pypdf.PdfReader(io.BytesIO(await file.read()))
+            for page in pdf_reader.pages:
+                content += page.extract_text() + "\n"
+        else:
+            content = (await file.read()).decode("utf-8")
+
+        # 3. Chop into AI Vectors
+        words = content.split()
+        chunks = [' '.join(words[i:i+200]) for i in range(0, len(words), 200)]
+        
+        vectors = []
+        for chunk in chunks:
+            if len(chunk) > 20:
+                emb = safe_embed(chunk, api_key)
+                if any(v != 0.0 for v in emb):
+                    vectors.append({
+                        "id": f"doc_{uuid.uuid4()}",
+                        "values": emb,
+                        "metadata": {"type": "knowledge", "text": chunk, "url": f"Document: {file.filename}"}
+                    })
+
+        # 4. Save to Pinecone
+        if vectors:
+            batch_size = 50
+            for i in range(0, len(vectors), batch_size):
+                index.upsert(vectors=vectors[i:i+batch_size], namespace=client_id)
+
+        return {"status": "success", "filename": file.filename}
+    except Exception as e:
+        logger.error(f"File upload failed: {str(e)}")
+        return {"status": "error", "message": str(e)}
 @app.get("/")
 def health(): return {"status": "Omni-Brain v28.1 - Universal SDR Active"}

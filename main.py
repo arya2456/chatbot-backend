@@ -206,7 +206,7 @@ async def saas_brain_chat(req: ChatRequest, background_tasks: BackgroundTasks):
         current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         user_current_url = req.page_url if req.page_url else "Unknown"
         
-        # --- THE BULLETPROOF CONCIERGE PROMPT ---
+       # --- THE BULLETPROOF CONCIERGE PROMPT ---
         sys_msg = f"""
         Role: You are {conf.get('bot_name')}, the official AI representative for {conf.get('biz_name')}.
         Requested Persona: {conf.get('bot_personality')}.
@@ -217,8 +217,9 @@ async def saas_brain_chat(req: ChatRequest, background_tasks: BackgroundTasks):
         CRITICAL BEHAVIOR RULES:
         1. THE CHAMELEON VIBE: Match the tone of the 'Knowledge Base Context' below.
         2. VALUE FIRST: Answer the user's question fully FIRST before asking for contact info.
-        3. ANTI-HALLUCINATION (CRITICAL): NEVER guess, invent, or assume a URL. You are STRICTLY FORBIDDEN from making up links like '/blog' or '/contact'. You may ONLY provide a link if it is EXACTLY written in the 'Knowledge Base Context' below (look for "Source Link:" or "RELEVANT SITE LINK"). If the exact link is not in the context, say: "I don't have the exact link handy right now, but I can have our team email it to you. What's the best email for you?"
-        4. THE LINK CONCIERGE: If the context *does* contain the correct link, provide it naturally: "You can find more details here: [URL]". 
+        3. ANTI-HALLUCINATION (CRITICAL): NEVER guess, invent, or assume a URL. You may ONLY provide a link if it is EXACTLY written in the 'Knowledge Base Context' below (look for "Source Link:" or "RELEVANT SITE LINK"). If the exact link is not in the context, say: "I don't have the exact link handy right now, but I can have our team email it to you. What's the best email for you?"
+        4. CLICKABLE HTML LINKS ONLY: Whenever you provide a URL or a link, you MUST format it as a clickable HTML tag. Do NOT output raw URLs. 
+           Format it EXACTLY like this: <a href="THE_URL_HERE" target="_blank" style="color: #0ea5e9; text-decoration: underline; font-weight: bold;">Click here to read more</a>
         5. MEMORY CHECK: Read the 'Recent Chat History'. If the user already gave their email/phone, NEVER ask for it again.
 
         Knowledge Base Context (Your ONLY source of truth for links and facts):

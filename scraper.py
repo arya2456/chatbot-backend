@@ -55,7 +55,21 @@ def crawl_website(start_url: str, max_pages: int = 15) -> list:
                 # Remove these tags so we don't duplicate them in the next step
                 structural_tag.decompose() 
 
-            # 3. GRAB THE MAIN BODY CONTENT
+            # --- NEW: 3. EXTRACT X-RAY LINKS (Crucial for Concierge Bot) ---
+            for a_tag in soup.find_all('a', href=True):
+                link_text = a_tag.get_text(separator=' ', strip=True)
+                href = a_tag['href']
+                
+                # Make sure the link is a full URL
+                if href.startswith('/'):
+                    href = urljoin(current_url, href)
+                    
+                # Save it clearly so the AI knows it's a clickable link
+                if len(link_text) > 3 and href.startswith('http') and base_domain in href:
+                    page_text_parts.append(f"RELEVANT SITE LINK -> [{link_text}] URL: {href}")
+            # ---------------------------------------------------------------
+
+            # 4. GRAB THE MAIN BODY CONTENT
             valid_tags = ['h1', 'h2', 'h3', 'h4', 'h5', 'p', 'li', 'span', 'td', 'a']
             
             for tag in soup.find_all(valid_tags):

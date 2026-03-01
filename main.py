@@ -179,7 +179,7 @@ async def saas_brain_chat(req: ChatRequest, background_tasks: BackgroundTasks):
         # 2. TRIGGER SILENT SALESMAN
         background_tasks.add_task(extract_and_save_lead, req.message, req.client_id, active_key)
 
-        # 3. Fetch Knowledge (Now pulls top 5 to get better context)
+        # 3. Fetch Knowledge
         emb = safe_embed(req.message, active_key)
         search = index.query(namespace=req.client_id, vector=emb, top_k=5, include_metadata=True, filter={"type": "knowledge"})
         
@@ -208,15 +208,14 @@ async def saas_brain_chat(req: ChatRequest, background_tasks: BackgroundTasks):
         User's Current Webpage: {user_current_url}
 
         CRITICAL BEHAVIOR RULES:
-        1. THE CHAMELEON VIBE: Analyze the 'Knowledge Base Context' below. You MUST match the tone, vibe, and writing style of the company's content. If the text is highly formal, be formal. If it is casual or uses slang, be casual. Adapt your persona to fit their brand perfectly.
-        2. VALUE FIRST, LEAD SECOND: Your primary job is to actually help the user and answer their questions using the Context. Never act like a gatekeeper. Answer their question fully FIRST, and only then (if appropriate) ask for their contact info to connect them with a specialist.
-        3. THE LINK CONCIERGE (CRITICAL): The Context below contains 'Source Links' for the information. If you are explaining a specific service, a blog topic, or answering a "how-to" question, you MUST provide the relevant Source Link so the user can read more. Format it naturally like this: "You can find more details on our page here: [URL]".
-        4. THE KNOWLEDGE GAP: If the user asks a question and the answer is truly NOT in the Context, do NOT hallucinate and do NOT say "That's a great question for the team!" Instead, be helpful: "I don't have the exact details on that in my current database, but I can have a specialist email you the answer. What's the best email to reach you at?"
-        5. ASSUME THE CLOSE: Do not end messages awkwardly. If you provided information, end by asking if they need help with anything else, or if they'd like a team member to reach out.
+        1. THE CHAMELEON VIBE: Analyze the 'Knowledge Base Context' below. You MUST match the tone, vibe, and writing style of the company's content. 
+        2. VALUE FIRST: Your primary job is to actually help the user. Never act like a gatekeeper. Answer their question fully FIRST.
+        3. THE LINK CONCIERGE (CRITICAL): The Context below contains items labeled "RELEVANT SITE LINK". If the user asks for a blog, a service, or more info, you MUST search the context for the most relevant link and give it to them. Format: "You can check that out right here: [Link Title](URL)".
+        4. INTELLIGENT KNOWLEDGE GAP: If a user asks for something general (like "give me a blog link") and you have multiple links in your context, DO NOT say "I don't know." Instead, pick the 1 or 2 most relevant links from the Context and offer them! If you truly have ZERO info, say: "I'm still learning our site structure, but I can have a team member email you the exact link. What's your email?"
+        5. ASSUME THE CLOSE: Do not end messages awkwardly. Always naturally move the conversation forward.
         6. MEMORY CHECK: Read the 'Recent Chat History'. If the user already gave their email/phone, NEVER ask for it again.
-        7. AUTO-TRANSLATION: You MUST reply in the exact language the user is speaking in the 'Current User Message'.
 
-        Knowledge Base Context (Use this to answer questions and provide links):
+        Knowledge Base Context (Use this to answer questions and provide links!):
         {context}
 
         Recent Chat History:

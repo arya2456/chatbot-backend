@@ -128,11 +128,12 @@ async def extract_and_save_lead(user_msg: str, client_id: str, api_key: str):
         logger.error(f"Lead extraction failed silently: {e}")
 
 # --- The Heavy Engine Room Task for Scrapping ---
+# --- The Heavy Engine Room Task for Scrapping ---
 async def perform_deep_sync(client_id: str, url: str, api_key: str):
     crawl_status_db[client_id] = {"status": "crawling", "progress": 10, "pages": 0}
     try:
         # 1. Start the Scrape!
-        pages_data = scraper.crawl_website(url, max_pages=15)
+        pages_data = scraper.crawl_website(url, max_pages=40)
         crawl_status_db[client_id] = {"status": "crawling", "progress": 50, "pages": len(pages_data)}
         
         # 2. Chop text into AI-friendly chunks (Vectors)
@@ -144,18 +145,24 @@ async def perform_deep_sync(client_id: str, url: str, api_key: str):
             
             for chunk in chunks:
                 if len(chunk) > 20: # Ignore tiny useless chunks
-                    emb = safe_embed(chunk, api_key)
+                    # Attach the Page Title to the chunk so the AI has context!
+                    context_rich_chunk = f"PAGE SOURCE: {page.get('title', 'Unknown Page')}\n{chunk}"
+                    
+                    emb = safe_embed(context_rich_chunk, api_key)
                     if any(v != 0.0 for v in emb):
                         vectors.append({
                             "id": f"doc_{uuid.uuid4()}",
                             "values": emb,
-                            "metadata": {"type": "knowledge", "text": chunk, "url": page["url"]}
+                            "metadata": {"type": "knowledge", "text": context_rich_chunk, "url": page["url"]}
                         })
                     else:
                         logger.warning("Skipped a chunk because Gemini failed to embed it.")
         
         # 3. Push to Pinecone in safe batches
         if vectors:
+            # Optional: Delete old data before pushing new data to prevent duplicates
+            # index.delete(delete_all=True, namespace=client_id) 
+            
             batch_size = 50
             for i in range(0, len(vectors), batch_size):
                 index.upsert(vectors=vectors[i:i+batch_size], namespace=client_id)

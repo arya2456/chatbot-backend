@@ -74,19 +74,35 @@ def crawl_website(start_url: str, max_pages: int = 40) -> list:
                     page_text_parts.append(f"[GLOBAL INFO]: {struct_text}")
                 structural_tag.decompose() 
 
-            # 3. EXTRACT X-RAY LINKS
+          # 3. EXTRACT X-RAY LINKS & BUILD CRAWL QUEUE
             for a_tag in soup.find_all('a', href=True):
                 link_text = a_tag.get_text(separator=' ', strip=True)
                 href = a_tag['href']
                 
-                if href.startswith('/'):
-                    href = urljoin(current_url, href)
-                    
+                # Ignore mailto, tel, javascript immediately
+                if href.startswith(('mailto:', 'tel:', 'javascript:')):
+                    continue
+                
+                # Automatically fix ALL relative links (e.g., '/about' or 'services.html')
+                href = urljoin(current_url, href)
                 href = clean_url(href)
                 link_domain = get_base_domain(href)
                 
-                if len(link_text) > 3 and href.startswith('http') and link_domain == base_domain:
-                    page_text_parts.append(f"[RELEVANT SITE LINK] -> [{link_text}] URL: {href}")
+                # Check if it's an internal link
+                if href.startswith('http') and link_domain == base_domain:
+                    
+                    # 1. Block media files (PDFs, Images) from breaking the HTML crawler
+                    skip_extensions = ('.pdf', '.jpg', '.jpeg', '.png', '.gif', '.mp4', '.zip', '.svg')
+                    is_media = any(href.lower().split('?')[0].endswith(ext) for ext in skip_extensions)
+                    
+                    # 2. ALWAYS add valid pages to the crawl queue
+                    if href not in visited and href not in to_visit and is_valid_content_page(href) and not is_media:
+                        to_visit.append(href)
+                        
+                    # 3. Save to AI Memory: Must have text, and DO NOT repeat the exact same link twice
+                    link_entry = f"[RELEVANT SITE LINK] -> [{link_text}] URL: {href}"
+                    if len(link_text) >= 2 and link_entry not in page_text_parts: 
+                        page_text_parts.append(link_entry)
                     
                     if href not in visited and href not in to_visit and is_valid_content_page(href):
                         to_visit.append(href)

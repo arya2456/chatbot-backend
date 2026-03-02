@@ -195,6 +195,8 @@ async def saas_brain_chat(req: ChatRequest, background_tasks: BackgroundTasks):
             text = match['metadata'].get('text', '')
             url = match['metadata'].get('url', 'No link available')
             context += f"Content: {text}\nSource Link: {url}\n\n"
+            # --- THE X-RAY DIAGNOSTIC LINE ---
+        logger.info(f"\n========== RAW PINECONE CONTEXT ==========\n{context}\n==========================================")
         
         # 4. Retrieve Short-Term Memory
         if req.session_id not in session_memory:

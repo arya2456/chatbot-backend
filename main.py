@@ -17,15 +17,12 @@ import scraper
 # --- 1. CONFIG ---
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
 PINECONE_INDEX_NAME = os.getenv("PINECONE_INDEX_NAME", "chatbot-index")
-# This points the AI to your new MySQL Brain!
 PHP_DASHBOARD_URL = "https://dashboard.fcmedia.in/api.php" 
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# A temporary memory bank to track crawl progress for the dashboard
 crawl_status_db = {}
-# Short-term memory for active chats so the bot remembers the user
 session_memory = {}
 
 @asynccontextmanager
@@ -72,13 +69,9 @@ def safe_embed(text, api_key):
         
     genai.configure(api_key=api_key)
     try: 
-        # 1. Generate the embedding
         emb = genai.embed_content(model="models/gemini-embedding-001", content=text)['embedding']
-        
-        # 2. Slice it down to 768 to fit your database
         if len(emb) > 768:
             return emb[:768]
-            
         return emb
     except Exception as e: 
         logger.error(f"Gemini Embed Error: {str(e)}")
@@ -87,7 +80,6 @@ def safe_embed(text, api_key):
 # --- The Silent SDR (Lead Extractor) ---
 async def extract_and_save_lead(user_msg: str, client_id: str, api_key: str):
     """Silently scans messages for contact info and pushes to MySQL CRM."""
-    # Fast check: Only run AI if there's an '@' symbol or a cluster of numbers
     if "@" not in user_msg and len(re.findall(r'\d', user_msg)) < 7:
         return
 
@@ -105,7 +97,6 @@ async def extract_and_save_lead(user_msg: str, client_id: str, api_key: str):
         cleaned_json = resp.text.replace("```json", "").replace("```", "").strip()
         lead_data = json.loads(cleaned_json)
         
-        # If actionable data is found, push to Dashboard
         if lead_data.get("email") or lead_data.get("phone"):
             payload = {
                 "client_id": client_id,
@@ -115,9 +106,8 @@ async def extract_and_save_lead(user_msg: str, client_id: str, api_key: str):
                 "company": lead_data.get("company") or "",
                 "message": user_msg 
             }
-            # Add Hostinger bypass headers just in case
             headers = {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
                 "Accept": "application/json",
                 "Content-Type": "application/json"
             }
@@ -127,48 +117,69 @@ async def extract_and_save_lead(user_msg: str, client_id: str, api_key: str):
     except Exception as e:
         logger.error(f"Lead extraction failed silently: {e}")
 
-# --- The Heavy Engine Room Task for Scrapping ---
-# --- The Heavy Engine Room Task for Scrapping ---
+# --- The Heavy Engine Room Task for Scrapping (Now with MD5 Cost Saving!) ---
 async def perform_deep_sync(client_id: str, url: str, api_key: str):
     crawl_status_db[client_id] = {"status": "crawling", "progress": 10, "pages": 0}
     try:
-        # 1. Start the Scrape!
-        pages_data = scraper.crawl_website(url, max_pages=40)
-        crawl_status_db[client_id] = {"status": "crawling", "progress": 50, "pages": len(pages_data)}
+        # 1. Start the Scrape! (Max 200 pages for Sitemap mapping)
+        pages_data = scraper.crawl_website(url, max_pages=200)
+        crawl_status_db[client_id] = {"status": "processing", "progress": 50, "pages": len(pages_data)}
         
-        # 2. Chop text into AI-friendly chunks (Vectors)
-        vectors = []
+        # 2. Chop text and generate MD5 Fingerprints
+        all_chunks_info = []
         for page in pages_data:
             words = page['text'].split()
-            # Split page into chunks of ~200 words
             chunks = [' '.join(words[i:i+200]) for i in range(0, len(words), 200)]
             
             for chunk in chunks:
-                if len(chunk) > 20: # Ignore tiny useless chunks
-                    # Attach the Page Title to the chunk so the AI has context!
+                if len(chunk) > 20: 
                     context_rich_chunk = f"PAGE SOURCE: {page.get('title', 'Unknown Page')}\n{chunk}"
                     
-                    emb = safe_embed(context_rich_chunk, api_key)
-                    if any(v != 0.0 for v in emb):
-                        vectors.append({
-                            "id": f"doc_{uuid.uuid4()}",
-                            "values": emb,
-                            "metadata": {"type": "knowledge", "text": context_rich_chunk, "url": page["url"]}
-                        })
-                    else:
-                        logger.warning("Skipped a chunk because Gemini failed to embed it.")
+                    # Create a unique MD5 fingerprint for this exact block of text
+                    chunk_hash = hashlib.md5(context_rich_chunk.encode('utf-8')).hexdigest()
+                    
+                    all_chunks_info.append({
+                        "id": f"doc_{chunk_hash}",
+                        "text": context_rich_chunk,
+                        "url": page["url"]
+                    })
+
+        # 3. Batch Check Pinecone: What do we already know?
+        existing_ids = set()
+        chunk_ids = [c["id"] for c in all_chunks_info]
         
-        # 3. Push to Pinecone in safe batches
-        if vectors:
-            # Optional: Delete old data before pushing new data to prevent duplicates
-            # index.delete(delete_all=True, namespace=client_id) 
-            
+        for i in range(0, len(chunk_ids), 500):
+            try:
+                res = index.fetch(ids=chunk_ids[i:i+500], namespace=client_id)
+                existing_ids.update(res.vectors.keys())
+            except Exception as e:
+                logger.warning(f"Pinecone check failed, embedding all: {e}")
+
+        # 4. Only send NEW or EDITED text to Google Gemini (Saves $$$)
+        vectors_to_upsert = []
+        embedded_count = 0
+
+        for chunk_data in all_chunks_info:
+            if chunk_data["id"] not in existing_ids:
+                emb = safe_embed(chunk_data["text"], api_key)
+                if any(v != 0.0 for v in emb):
+                    vectors_to_upsert.append({
+                        "id": chunk_data["id"],
+                        "values": emb,
+                        "metadata": {"type": "knowledge", "text": chunk_data["text"], "url": chunk_data["url"]}
+                    })
+                    embedded_count += 1
+
+        # 5. Push the new data to Pinecone
+        if vectors_to_upsert:
             batch_size = 50
-            for i in range(0, len(vectors), batch_size):
-                index.upsert(vectors=vectors[i:i+batch_size], namespace=client_id)
+            for i in range(0, len(vectors_to_upsert), batch_size):
+                index.upsert(vectors=vectors_to_upsert[i:i+batch_size], namespace=client_id)
                 
         crawl_status_db[client_id] = {"status": "complete", "progress": 100, "pages": len(pages_data)}
-        logger.info(f"Deep sync complete for {client_id}")
+        
+        logger.info(f"✅ Deep Sync Complete! Embedded (New Data): {embedded_count} | Skipped (Saved API Cost): {len(all_chunks_info) - embedded_count}")
+        
     except Exception as e:
         logger.error(f"Deep sync failed: {str(e)}")
         crawl_status_db[client_id] = {"status": "error", "progress": 0, "pages": 0}
@@ -186,7 +197,7 @@ async def saas_brain_chat(req: ChatRequest, background_tasks: BackgroundTasks):
         # 2. TRIGGER SILENT SALESMAN
         background_tasks.add_task(extract_and_save_lead, req.message, req.client_id, active_key)
 
-        # 3. Fetch Knowledge (Increased to 8 to guarantee it finds the links!)
+        # 3. Fetch Knowledge
         emb = safe_embed(req.message, active_key)
         search = index.query(namespace=req.client_id, vector=emb, top_k=8, include_metadata=True, filter={"type": "knowledge"})
         
@@ -195,7 +206,8 @@ async def saas_brain_chat(req: ChatRequest, background_tasks: BackgroundTasks):
             text = match['metadata'].get('text', '')
             url = match['metadata'].get('url', 'No link available')
             context += f"Content: {text}\nSource Link: {url}\n\n"
-            # --- THE X-RAY DIAGNOSTIC LINE ---
+            
+        # --- THE X-RAY DIAGNOSTIC LINE ---
         logger.info(f"\n========== RAW PINECONE CONTEXT ==========\n{context}\n==========================================")
         
         # 4. Retrieve Short-Term Memory
@@ -208,7 +220,7 @@ async def saas_brain_chat(req: ChatRequest, background_tasks: BackgroundTasks):
         current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         user_current_url = req.page_url if req.page_url else "Unknown"
         
-       # --- THE BULLETPROOF CONCIERGE PROMPT ---
+        # --- THE BULLETPROOF CONCIERGE PROMPT ---
         sys_msg = f"""
         Role: You are {conf.get('bot_name')}, the official AI representative for {conf.get('biz_name')}.
         Requested Persona: {conf.get('bot_personality')}.
@@ -216,7 +228,7 @@ async def saas_brain_chat(req: ChatRequest, background_tasks: BackgroundTasks):
         System Time: {current_time}
         User's Current Webpage: {user_current_url}
 
-     CRITICAL BEHAVIOR RULES:
+        CRITICAL BEHAVIOR RULES:
         1. THE CHAMELEON VIBE: Match the tone of the 'Knowledge Base Context' below.
         2. VALUE FIRST: Answer the user's question fully FIRST before asking for contact info.
         3. HOW TO FIND LINKS (CRITICAL): If the user asks for a link, look INSIDE the "Content:" text for a tag that looks like this: "[RELEVANT SITE LINK] -> [...] URL: [The Link]". You may ONLY give the user the link if you see it written explicitly there. 
@@ -254,7 +266,7 @@ async def saas_brain_chat(req: ChatRequest, background_tasks: BackgroundTasks):
                 "bot_msg": ans
             }
             headers = {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
                 "Accept": "application/json",
                 "Content-Type": "application/json"
             }
@@ -268,18 +280,16 @@ async def saas_brain_chat(req: ChatRequest, background_tasks: BackgroundTasks):
 # --- THE NEW LEAD PUSHER ---
 @app.post("/capture-lead")
 async def capture_lead(req: dict):
-    # If the widget sends leads here, immediately push them to the MySQL database
     try:
         headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
             "Accept": "application/json",
             "Content-Type": "application/json"
         }
         db_response = requests.post(f"{PHP_DASHBOARD_URL}?action=save_lead", json=req, headers=headers, timeout=3)
         logger.info(f"MySQL Lead Sync Status: {db_response.status_code}")
         
-        # Optional: Save a backup to Pinecone just in case
-        log_meta = req
+        log_meta = req.copy()
         log_meta["type"] = "lead"
         log_meta["timestamp"] = int(time.time())
         index.upsert(vectors=[{"id": f"lead_{uuid.uuid4()}", "values": [0.0]*768, "metadata": log_meta}], namespace=req.get("client_id", "default"))
@@ -305,17 +315,14 @@ async def train_saas_engine(req: TrainRequest, background_tasks: BackgroundTasks
     except:
         existing_conf = {}
 
-    # Extract only the data sent by the dashboard, avoiding defaults from overwriting your config
     incoming_data = req.model_dump(exclude_unset=True) if hasattr(req, 'model_dump') else req.dict(exclude_unset=True)
     
     meta = existing_conf.copy()
     meta.update(incoming_data)
     meta["type"] = "config"
     
-    # Ensuring the config vector matches the index dimension (768)
     index.upsert(vectors=[{"id": f"config_{req.client_id}", "values": [1.0]*768, "metadata": meta}], namespace=req.client_id)
     
-    # If the user pushed the "Deep Sync Site" button, trigger the scraper!
     active_key = meta.get("gemini_api_key", req.gemini_api_key)
     if incoming_data.get("url"):
         background_tasks.add_task(perform_deep_sync, req.client_id, meta.get("url", ""), active_key)
@@ -326,17 +333,16 @@ async def train_saas_engine(req: TrainRequest, background_tasks: BackgroundTasks
 @app.post("/get-crawl-status")
 async def get_crawl_status(req: StatusRequest):
     return crawl_status_db.get(req.client_id, {"status": "idle", "progress": 0, "pages": 0})
+
 # --- MISSING DASHBOARD FEATURE: Document Upload ---
 @app.post("/upload-file")
 async def upload_document(client_id: str, file: UploadFile = File(...)):
     try:
-        # 1. Verify API Key
         res = index.fetch(ids=[f"config_{client_id}"], namespace=client_id)
         conf = res.vectors[f"config_{client_id}"].metadata if res.vectors else {}
         api_key = conf.get("gemini_api_key", "")
         if not api_key: return {"status": "error", "message": "API Key missing."}
 
-        # 2. Read File Content
         content = ""
         if file.filename.lower().endswith('.pdf'):
             pdf_reader = pypdf.PdfReader(io.BytesIO(await file.read()))
@@ -345,7 +351,6 @@ async def upload_document(client_id: str, file: UploadFile = File(...)):
         else:
             content = (await file.read()).decode("utf-8")
 
-        # 3. Chop into AI Vectors
         words = content.split()
         chunks = [' '.join(words[i:i+200]) for i in range(0, len(words), 200)]
         
@@ -360,7 +365,6 @@ async def upload_document(client_id: str, file: UploadFile = File(...)):
                         "metadata": {"type": "knowledge", "text": chunk, "url": f"Document: {file.filename}"}
                     })
 
-        # 4. Save to Pinecone
         if vectors:
             batch_size = 50
             for i in range(0, len(vectors), batch_size):
@@ -370,5 +374,6 @@ async def upload_document(client_id: str, file: UploadFile = File(...)):
     except Exception as e:
         logger.error(f"File upload failed: {str(e)}")
         return {"status": "error", "message": str(e)}
+
 @app.get("/")
 def health(): return {"status": "Omni-Brain v28.1 - Universal SDR Active"}

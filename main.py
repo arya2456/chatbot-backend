@@ -29,7 +29,7 @@ session_memory = {}
 async def lifespan(app: FastAPI):
     yield
 
-app = FastAPI(title="Omni-Brain v28.1", lifespan=lifespan)
+app = FastAPI(title="Omni-Brain v29.0 - E-Com Edition", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 def connect_db():
@@ -49,6 +49,12 @@ class TrainRequest(BaseModel):
     collect_phone: bool = False; collect_company: bool = False; book_call_link: str = ""
     whatsapp_number: str = ""; bot_status: bool = True; response_delay_ms: int = 1500
     max_conv_length: int = 50; fallback_msg: str = "I'm not sure. Would you like to speak to a human?"
+    
+    # --- UNIVERSAL E-COMMERCE INTEGRATION ---
+    ecom_platform: str = ""  # e.g., "woocommerce", "shopify", "none"
+    ecom_url: str = ""       # e.g., "https://clientstore.com"
+    ecom_key: str = ""       # e.g., ck_12345 or shpat_12345
+    ecom_secret: str = ""    # e.g., cs_12345
 
 class ChatRequest(BaseModel):
     message: str; client_id: str; session_id: str = "Guest"; page_url: str = ""; api_key: str = ""
@@ -57,7 +63,7 @@ class StatusRequest(BaseModel):
     client_id: str; message: Optional[str] = None; session_id: Optional[str] = None
     api_key: Optional[str] = None; page_url: Optional[str] = None
 
-# --- 3. HELPERS ---
+# --- 3. HELPERS & SKILLS ---
 def get_model(api_key):
     genai.configure(api_key=api_key)
     return genai.GenerativeModel("gemini-2.5-flash")
@@ -77,9 +83,42 @@ def safe_embed(text, api_key):
         logger.error(f"Gemini Embed Error: {str(e)}")
         return [0.0] * 768
 
+# E-COMMERCE API SKILL
+def check_ecommerce_order(platform: str, url: str, key: str, secret: str, order_id: str):
+    if not url or not key:
+        return "Error: Store credentials are not fully configured in the dashboard."
+        
+    platform = platform.lower().strip()
+    
+    if platform == "woocommerce":
+        # WooCommerce REST API: GET /wp-json/wc/v3/orders/<id>
+        api_url = urljoin(url, f"/wp-json/wc/v3/orders/{order_id}")
+        try:
+            # WooCommerce uses basic auth for the consumer key/secret
+            resp = requests.get(api_url, auth=(key, secret), timeout=10)
+            if resp.status_code == 200:
+                data = resp.json()
+                status = data.get("status", "Unknown").title()
+                total = data.get("total", "0.00")
+                currency = data.get("currency", "")
+                
+                # Format a friendly summary for Gemini to read
+                return f"SUCCESS: Order {order_id} was found. Current Status: {status}. Order Total: {total} {currency}."
+            elif resp.status_code == 404:
+                return f"NOT FOUND: Order {order_id} does not exist in the system."
+            else:
+                return f"ERROR: Failed to retrieve order. API Status Code {resp.status_code}."
+        except Exception as e:
+            return f"API ERROR: Could not connect to the store database: {str(e)}"
+            
+    elif platform == "shopify":
+        # Placeholder for future Shopify logic
+        return "Shopify tracking is coming soon."
+        
+    return "Error: E-commerce platform not recognized."
+
 # --- The Silent SDR (Lead Extractor) ---
 async def extract_and_save_lead(user_msg: str, client_id: str, api_key: str):
-    """Silently scans messages for contact info and pushes to MySQL CRM."""
     if "@" not in user_msg and len(re.findall(r'\d', user_msg)) < 7:
         return
 
@@ -117,15 +156,13 @@ async def extract_and_save_lead(user_msg: str, client_id: str, api_key: str):
     except Exception as e:
         logger.error(f"Lead extraction failed silently: {e}")
 
-# --- The Heavy Engine Room Task for Scrapping (Now with MD5 Cost Saving!) ---
+# --- The Heavy Engine Room Task for Scrapping ---
 async def perform_deep_sync(client_id: str, url: str, api_key: str):
     crawl_status_db[client_id] = {"status": "crawling", "progress": 10, "pages": 0}
     try:
-        # 1. Start the Scrape! (Max 200 pages for Sitemap mapping)
         pages_data = scraper.crawl_website(url, max_pages=200)
         crawl_status_db[client_id] = {"status": "processing", "progress": 50, "pages": len(pages_data)}
         
-        # 2. Chop text and generate MD5 Fingerprints
         all_chunks_info = []
         for page in pages_data:
             words = page['text'].split()
@@ -134,17 +171,13 @@ async def perform_deep_sync(client_id: str, url: str, api_key: str):
             for chunk in chunks:
                 if len(chunk) > 20: 
                     context_rich_chunk = f"PAGE SOURCE: {page.get('title', 'Unknown Page')}\n{chunk}"
-                    
-                    # Create a unique MD5 fingerprint for this exact block of text
                     chunk_hash = hashlib.md5(context_rich_chunk.encode('utf-8')).hexdigest()
-                    
                     all_chunks_info.append({
                         "id": f"doc_{chunk_hash}",
                         "text": context_rich_chunk,
                         "url": page["url"]
                     })
 
-        # 3. Batch Check Pinecone: What do we already know?
         existing_ids = set()
         chunk_ids = [c["id"] for c in all_chunks_info]
         
@@ -155,7 +188,6 @@ async def perform_deep_sync(client_id: str, url: str, api_key: str):
             except Exception as e:
                 logger.warning(f"Pinecone check failed, embedding all: {e}")
 
-        # 4. Only send NEW or EDITED text to Google Gemini (Saves $$$)
         vectors_to_upsert = []
         embedded_count = 0
 
@@ -170,15 +202,13 @@ async def perform_deep_sync(client_id: str, url: str, api_key: str):
                     })
                     embedded_count += 1
 
-        # 5. Push the new data to Pinecone
         if vectors_to_upsert:
             batch_size = 50
             for i in range(0, len(vectors_to_upsert), batch_size):
                 index.upsert(vectors=vectors_to_upsert[i:i+batch_size], namespace=client_id)
                 
         crawl_status_db[client_id] = {"status": "complete", "progress": 100, "pages": len(pages_data)}
-        
-        logger.info(f"✅ Deep Sync Complete! Embedded (New Data): {embedded_count} | Skipped (Saved API Cost): {len(all_chunks_info) - embedded_count}")
+        logger.info(f"✅ Deep Sync Complete! Embedded: {embedded_count} | Skipped: {len(all_chunks_info) - embedded_count}")
         
     except Exception as e:
         logger.error(f"Deep sync failed: {str(e)}")
@@ -207,9 +237,6 @@ async def saas_brain_chat(req: ChatRequest, background_tasks: BackgroundTasks):
             url = match['metadata'].get('url', 'No link available')
             context += f"Content: {text}\nSource Link: {url}\n\n"
             
-        # --- THE X-RAY DIAGNOSTIC LINE ---
-        logger.info(f"\n========== RAW PINECONE CONTEXT ==========\n{context}\n==========================================")
-        
         # 4. Retrieve Short-Term Memory
         if req.session_id not in session_memory:
             session_memory[req.session_id] = []
@@ -220,7 +247,6 @@ async def saas_brain_chat(req: ChatRequest, background_tasks: BackgroundTasks):
         current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         user_current_url = req.page_url if req.page_url else "Unknown"
         
-        # --- THE BULLETPROOF CONCIERGE PROMPT ---
         sys_msg = f"""
         Role: You are {conf.get('bot_name')}, the official AI representative for {conf.get('biz_name')}.
         Requested Persona: {conf.get('bot_personality')}.
@@ -232,10 +258,12 @@ async def saas_brain_chat(req: ChatRequest, background_tasks: BackgroundTasks):
         1. THE CHAMELEON VIBE: Match the tone of the 'Knowledge Base Context' below.
         2. VALUE FIRST: Answer the user's question fully FIRST before asking for contact info.
         3. HOW TO FIND LINKS (CRITICAL): If the user asks for a link, look INSIDE the "Content:" text for a tag that looks like this: "[RELEVANT SITE LINK] -> [...] URL: [The Link]". You may ONLY give the user the link if you see it written explicitly there. 
-        4. DO NOT INVENT URLS: The "Source Link" at the bottom of a context chunk is just where you read the text. It is NOT necessarily the link the user wants. Do NOT take a "Source Link" and add words or slashes to it to "guess" a new page (e.g., never turn "fcmedia.in" into "fcmedia.in/seo"). 
-        5. THE KNOWLEDGE GAP: If you cannot find the specific "[RELEVANT SITE LINK]" tag for what the user asked, you MUST say: "I don't have the exact link handy right now, but I can have our team email it to you. What's the best email for you?" Do not apologize, just state this clearly.
-        6. CLICKABLE HTML LINKS ONLY: Whenever you provide a valid URL, you MUST format it exactly like this: <a href="THE_EXACT_URL_HERE" target="_blank" style="color: #0ea5e9; text-decoration: underline; font-weight: bold;">Click here to read more</a>
-        7. MEMORY CHECK: Read the 'Recent Chat History'. If the user already gave their email/phone, NEVER ask for it again.
+        4. DO NOT INVENT URLS: Do NOT guess or invent pages. 
+        5. THE KNOWLEDGE GAP: If you cannot find the specific link/answer, say: "I don't have the exact link handy right now, but I can have our team email it to you. What's the best email for you?"
+        6. CLICKABLE HTML LINKS ONLY: Whenever you provide a valid URL, format it exactly like this: <a href="THE_EXACT_URL_HERE" target="_blank" style="color: #0ea5e9; text-decoration: underline; font-weight: bold;">Click here to read more</a>
+        7. MEMORY CHECK: Read the 'Recent Chat History'. If the user gave their email/phone, NEVER ask again.
+        
+        8. ORDER TRACKING (NEW SKILL): If the user asks about the status of an order AND they provide an order number, you MUST STOP TALKING and output EXACTLY this string: [CHECK_ORDER: their_order_number]. Do not say anything else in that message. If they ask about an order but do not provide a number, politely ask them to type their order number.
 
         Knowledge Base Context (Your ONLY source of truth for links and facts):
         {context}
@@ -248,6 +276,36 @@ async def saas_brain_chat(req: ChatRequest, background_tasks: BackgroundTasks):
         
         ans = get_model(active_key).generate_content(sys_msg).text
         
+        # --- THE E-COMMERCE INTERCEPTOR ---
+        if "[CHECK_ORDER:" in ans:
+            # Extract the ID from the string "[CHECK_ORDER: 12345]"
+            match = re.search(r'\[CHECK_ORDER:\s*#?([a-zA-Z0-9_-]+)\]', ans)
+            if match:
+                order_id = match.group(1)
+                
+                # Retrieve client's E-Commerce keys from Pinecone memory
+                platform = conf.get("ecom_platform", "")
+                store_url = conf.get("ecom_url", "")
+                store_key = conf.get("ecom_key", "")
+                store_secret = conf.get("ecom_secret", "")
+                
+                logger.info(f"Intercepted Order Request for ID: {order_id}. Checking Platform: {platform}")
+                
+                # Dip into WooCommerce API
+                raw_order_data = check_ecommerce_order(platform, store_url, store_key, store_secret, order_id)
+                
+                # Feed the raw API data back to Gemini to translate into a friendly message
+                follow_up_prompt = f"""
+                You are the AI assistant. The user just asked to track order #{order_id}.
+                We securely checked the store database and received this raw data: {raw_order_data}
+                
+                Translate this raw data into a polite, helpful message for the customer. DO NOT output the [CHECK_ORDER] tag again.
+                """
+                ans = get_model(active_key).generate_content(follow_up_prompt).text
+            else:
+                ans = "I'm having trouble reading that order number. Could you please double-check it and type it again?"
+        # --- END E-COMMERCE INTERCEPTOR ---
+
         # 6. Save to Short-Term Memory
         session_memory[req.session_id].append(f"User: {req.message}")
         session_memory[req.session_id].append(f"Bot: {ans}")
@@ -376,4 +434,4 @@ async def upload_document(client_id: str, file: UploadFile = File(...)):
         return {"status": "error", "message": str(e)}
 
 @app.get("/")
-def health(): return {"status": "Omni-Brain v28.1 - Universal SDR Active"}
+def health(): return {"status": "Omni-Brain v29.0 - E-Com Support Active"}

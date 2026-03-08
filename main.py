@@ -247,16 +247,22 @@ async def saas_brain_chat(req: ChatRequest, background_tasks: BackgroundTasks):
         current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         user_current_url = req.page_url if req.page_url else "Unknown"
         
+        # --- FIX: GRAB THE CUSTOM RULES FROM THE DASHBOARD ---
+        custom_rules = conf.get('bot_personality', 'Professional')
+        
         sys_msg = f"""
         Role: You are {conf.get('bot_name')}, the official AI representative for {conf.get('biz_name')}.
-        Requested Persona: {conf.get('bot_personality')}.
         Business Details: {biz_contact}
         System Time: {current_time}
         User's Current Webpage: {user_current_url}
 
+        === CRITICAL CLIENT INSTRUCTIONS ===
+        You MUST strictly obey these rules for this specific client:
+        {custom_rules}
+
         CRITICAL BEHAVIOR RULES:
         1. THE CHAMELEON VIBE: Match the tone of the 'Knowledge Base Context' below.
-        2. VALUE FIRST: Answer the user's question fully FIRST before asking for contact info.
+        2. VALUE FIRST: Answer the user's question fully FIRST before asking for contact info (unless the Custom Instructions say otherwise).
         3. HOW TO FIND LINKS (CRITICAL): If the user asks for a link, look INSIDE the "Content:" text for a tag that looks like this: "[RELEVANT SITE LINK] -> [...] URL: [The Link]". You may ONLY give the user the link if you see it written explicitly there. 
         4. DO NOT INVENT URLS: Do NOT guess or invent pages. 
         5. THE KNOWLEDGE GAP: If you cannot find the specific link/answer, say: "I don't have the exact link handy right now, but I can have our team email it to you. What's the best email for you?"
@@ -427,6 +433,14 @@ async def upload_document(client_id: str, file: UploadFile = File(...)):
             batch_size = 50
             for i in range(0, len(vectors), batch_size):
                 index.upsert(vectors=vectors[i:i+batch_size], namespace=client_id)
+
+        # --- FIX: REPORT UPLOAD TO DASHBOARD MYSQL ---
+        try:
+            payload = { "client_id": client_id, "filename": file.filename }
+            headers = {"Content-Type": "application/json"}
+            requests.post(f"{PHP_DASHBOARD_URL}?action=save_document", json=payload, headers=headers, timeout=3)
+        except Exception as db_e:
+            logger.error(f"Could not report document to PHP: {db_e}")
 
         return {"status": "success", "filename": file.filename}
     except Exception as e:

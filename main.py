@@ -437,13 +437,18 @@ async def upload_document(client_id: str, file: UploadFile = File(...)):
             for i in range(0, len(vectors), batch_size):
                 index.upsert(vectors=vectors[i:i+batch_size], namespace=client_id)
 
-        # --- FIX: REPORT UPLOAD TO DASHBOARD MYSQL ---
+        # --- BULLETPROOF: REPORT UPLOAD TO DASHBOARD MYSQL ---
         try:
             payload = { "client_id": client_id, "filename": file.filename }
-            headers = {"Content-Type": "application/json"}
-            requests.post(f"{PHP_DASHBOARD_URL}?action=save_document", json=payload, headers=headers, timeout=3)
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+                "Accept": "application/json",
+                "Content-Type": "application/json"
+            }
+            db_response = requests.post(f"{PHP_DASHBOARD_URL}?action=save_document", json=payload, headers=headers, timeout=5)
+            logger.info(f"Document Save Status: {db_response.status_code} - {db_response.text}")
         except Exception as db_e:
-            logger.error(f"Could not report document to PHP: {db_e}")
+            logger.error(f"FATAL: Could not report document to PHP: {db_e}")
 
         return {"status": "success", "filename": file.filename}
     except Exception as e:

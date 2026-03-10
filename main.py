@@ -45,6 +45,7 @@ class TrainRequest(BaseModel):
     client_id: str; url: str; gemini_api_key: str = ""
     bot_name: str = "AI Assistant"; bot_lang: str = "English"; bot_personality: str = "Professional"
     bot_color: str = "#4F46E5"; bot_avatar: str = ""; biz_name: str = ""; biz_phone: str = ""; biz_email: str = ""
+    greeting_msg: str = ""
     leads_trigger: str = "price"; collect_name: bool = True; collect_email: bool = True
     collect_phone: bool = False; collect_company: bool = False; book_call_link: str = ""
     whatsapp_number: str = ""; bot_status: bool = True; response_delay_ms: int = 1500

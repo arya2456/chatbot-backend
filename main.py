@@ -192,9 +192,10 @@ async def extract_and_save_lead(user_msg: str, client_id: str, api_key: str):
                     msg['Subject'] = f"🚀 New Lead Captured: {payload['name']}"
                     
                     # NOTE: YOU MUST CONFIGURE THESE 3 LINES TO SEND EMAILS
-                    SENDER_EMAIL = "your-email@gmail.com" # Put your sending email here
-                    SENDER_PASS = "your-app-password"     # Put your email password here
-                    SMTP_SERVER = "smtp.gmail.com"        # Change if using Hostinger etc.
+                    SENDER_EMAIL = "newleadalert@fcmedia.in" # Put your sending email here
+                    SENDER_PASS = "x59jPzrCRAfW
+"     # Put your email password here
+                    SMTP_SERVER = "smtp.zoho.in       # Change if using Hostinger etc.
                     
                     msg['From'] = SENDER_EMAIL
                     msg['To'] = alert_email

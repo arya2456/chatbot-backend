@@ -10,6 +10,8 @@ import aiohttp, pypdf
 import google.generativeai as genai
 from contextlib import asynccontextmanager
 from datetime import datetime
+import smtplib
+from email.message import EmailMessage
 
 # --- Import your new scraper module ---
 import scraper 
@@ -51,6 +53,10 @@ class TrainRequest(BaseModel):
     collect_phone: bool = False; collect_company: bool = False; book_call_link: str = ""
     whatsapp_number: str = ""; bot_status: bool = True; response_delay_ms: int = 1500
     max_conv_length: int = 50; fallback_msg: str = "I'm not sure. Would you like to speak to a human?"
+
+    # --- AUTOMATION & ALERTS ---
+    webhook_url: str = ""
+    alert_email: str = ""
     
     # --- UNIVERSAL E-COMMERCE INTEGRATION ---
     ecom_platform: str = ""  # e.g., "woocommerce", "shopify", "none"
@@ -119,12 +125,25 @@ def check_ecommerce_order(platform: str, url: str, key: str, secret: str, order_
         
     return "Error: E-commerce platform not recognized."
 
-# --- The Silent SDR (Lead Extractor) ---
+# --- The Silent SDR (Lead Extractor & Automator) ---
 async def extract_and_save_lead(user_msg: str, client_id: str, api_key: str):
     if "@" not in user_msg and len(re.findall(r'\d', user_msg)) < 7:
         return
 
     try:
+        # 1. Get Client Config for Webhooks & Emails
+        try:
+            res = index.fetch(ids=[f"config_{client_id}"], namespace=client_id)
+            conf = res.vectors[f"config_{client_id}"].metadata if res.vectors else {}
+        except Exception as db_err:
+            logger.error(f"Failed to fetch config for lead trigger: {db_err}")
+            conf = {}
+            
+        webhook_url = conf.get("webhook_url", "")
+        alert_email = conf.get("alert_email", "")
+        biz_name = conf.get("biz_name", "Your Business")
+
+        # 2. Extract Lead Data via Gemini
         genai.configure(api_key=api_key)
         model = genai.GenerativeModel("gemini-2.5-flash")
         
@@ -139,6 +158,8 @@ async def extract_and_save_lead(user_msg: str, client_id: str, api_key: str):
         lead_data = json.loads(cleaned_json)
         
         if lead_data.get("email") or lead_data.get("phone"):
+            
+            # 3. Build Standard Payload
             payload = {
                 "client_id": client_id,
                 "email": lead_data.get("email") or "Unknown",
@@ -147,13 +168,63 @@ async def extract_and_save_lead(user_msg: str, client_id: str, api_key: str):
                 "company": lead_data.get("company") or "",
                 "message": user_msg 
             }
-            headers = {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-                "Accept": "application/json",
-                "Content-Type": "application/json"
-            }
-            requests.post(f"{PHP_DASHBOARD_URL}?action=save_lead", json=payload, headers=headers, timeout=5)
-            logger.info(f"💰 SILENT LEAD CAPTURED: {lead_data.get('email') or lead_data.get('phone')}")
+            
+            # --- ACTION A: Save to MySQL Dashboard ---
+            try:
+                headers = {"User-Agent": "Mozilla/5.0", "Accept": "application/json", "Content-Type": "application/json"}
+                requests.post(f"{PHP_DASHBOARD_URL}?action=save_lead", json=payload, headers=headers, timeout=5)
+                logger.info(f"💰 SILENT LEAD CAPTURED: {payload['email']} / {payload['phone']}")
+            except Exception as sql_err:
+                logger.error(f"MySQL Lead Save Failed: {sql_err}")
+
+            # --- ACTION B: Fire Webhook (Zapier / Make.com) ---
+            if webhook_url and webhook_url.startswith("http"):
+                try:
+                    requests.post(webhook_url, json=payload, headers=headers, timeout=5)
+                    logger.info("🚀 Webhook Fired Successfully!")
+                except Exception as hook_err:
+                    logger.error(f"Webhook Failed: {hook_err}")
+
+            # --- ACTION C: Send Instant Email Alert ---
+            if alert_email and "@" in alert_email:
+                try:
+                    msg = EmailMessage()
+                    msg['Subject'] = f"🚀 New Lead Captured: {payload['name']}"
+                    
+                    # NOTE: YOU MUST CONFIGURE THESE 3 LINES TO SEND EMAILS
+                    SENDER_EMAIL = "your-email@gmail.com" # Put your sending email here
+                    SENDER_PASS = "your-app-password"     # Put your email password here
+                    SMTP_SERVER = "smtp.gmail.com"        # Change if using Hostinger etc.
+                    
+                    msg['From'] = SENDER_EMAIL
+                    msg['To'] = alert_email
+                    
+                    # Beautiful HTML Email Body
+                    msg.set_content(f"You have a new lead!")
+                    msg.add_alternative(f"""
+                    <html>
+                        <body style="font-family: Arial, sans-serif; background: #f4f7fb; padding: 20px;">
+                            <div style="background: white; padding: 30px; border-radius: 10px; max-width: 600px; margin: 0 auto; border-top: 5px solid #4F46E5; box-shadow: 0 4px 15px rgba(0,0,0,0.05);">
+                                <h2 style="color: #1e293b; margin-top: 0;">New Lead Alert 🚀</h2>
+                                <p style="color: #64748b;">Your AI Assistant just captured a new lead for <strong>{biz_name}</strong>.</p>
+                                <table style="width: 100%; border-collapse: collapse; margin-top: 20px;">
+                                    <tr><td style="padding: 10px; border-bottom: 1px solid #e2e8f0; font-weight: bold; width: 120px;">Name</td><td style="padding: 10px; border-bottom: 1px solid #e2e8f0;">{payload['name']}</td></tr>
+                                    <tr><td style="padding: 10px; border-bottom: 1px solid #e2e8f0; font-weight: bold;">Email</td><td style="padding: 10px; border-bottom: 1px solid #e2e8f0;">{payload['email']}</td></tr>
+                                    <tr><td style="padding: 10px; border-bottom: 1px solid #e2e8f0; font-weight: bold;">Phone</td><td style="padding: 10px; border-bottom: 1px solid #e2e8f0;">{payload['phone']}</td></tr>
+                                    <tr><td style="padding: 10px; border-bottom: 1px solid #e2e8f0; font-weight: bold;">Company</td><td style="padding: 10px; border-bottom: 1px solid #e2e8f0;">{payload['company']}</td></tr>
+                                    <tr><td style="padding: 10px; font-weight: bold;">Last Message</td><td style="padding: 10px;"><i>"{payload['message']}"</i></td></tr>
+                                </table>
+                            </div>
+                        </body>
+                    </html>
+                    """, subtype='html')
+
+                    with smtplib.SMTP_SSL(SMTP_SERVER, 465) as smtp:
+                        smtp.login(SENDER_EMAIL, SENDER_PASS)
+                        smtp.send_message(msg)
+                    logger.info(f"📧 Email Alert Sent to {alert_email}")
+                except Exception as mail_err:
+                    logger.error(f"Email Alert Failed: {mail_err}")
             
     except Exception as e:
         logger.error(f"Lead extraction failed silently: {e}")

@@ -219,7 +219,8 @@ async def extract_and_save_lead(user_msg: str, client_id: str, api_key: str):
                     </html>
                     """, subtype='html')
 
-                    with smtplib.SMTP_SSL(SMTP_SERVER, 465) as smtp:
+                    with smtplib.SMTP(SMTP_SERVER, 587) as smtp:
+                        smtp.starttls() # This upgrades the connection to secure TLS
                         smtp.login(SENDER_EMAIL, SENDER_PASS)
                         smtp.send_message(msg)
                     logger.info(f"📧 Email Alert Sent to {alert_email}")

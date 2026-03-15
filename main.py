@@ -194,7 +194,7 @@ async def extract_and_save_lead(user_msg: str, client_id: str, api_key: str):
                     # NOTE: YOU MUST CONFIGURE THESE 3 LINES TO SEND EMAILS
                     SENDER_EMAIL = "newleadalert@fcmedia.in" # Put your sending email here
                     SENDER_PASS = "x59jPzrCRAfW"     # Put your email password here
-                    SMTP_SERVER = "smtp.zoho.in"       # Change if using Hostinger etc.
+                    SMTP_SERVER = "smtp.zoho.com"       # Change if using Hostinger etc.
                     
                     msg['From'] = SENDER_EMAIL
                     msg['To'] = alert_email
